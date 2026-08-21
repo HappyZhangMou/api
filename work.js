@@ -52,6 +52,10 @@ async function handleRequest(request, env, ctx) {
     return handleFetch(env, corsHeaders, ctx);
   }
 
+  if (url.pathname === '/process-now' && request.method === 'POST') {
+    return handleProcessNow(env, ctx, corsHeaders);
+  }
+
   if (url.pathname === '/retry-failed' && request.method === 'POST') {
     return handleRetryFailed(env, ctx, corsHeaders);
   }
@@ -241,8 +245,8 @@ async function processIpQueue(env) {
       // 读取当前缓存
       const current = await env.LINKS_KV.get('cached_aggregate');
       if (!current) break;
-
       const lines = current.split('\n');
+      console.log(`[Queue] Starting batch loop; total lines: ${lines.length}`);
       const pendingItems = [];
 
       // 收集本批次待处理的项（#未处理、带时间戳的 #分析失败-待重试@ts，或旧版 #UN未知）
@@ -394,6 +398,17 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
   }
 }
 
+// 管理端：强制触发后台处理（用于排查和即时处理）
+async function handleProcessNow(env, ctx, corsHeaders) {
+  try {
+    // 启动后台处理但不要阻塞响应
+    if (ctx) ctx.waitUntil(processIpQueue(env));
+    return new Response('Process started', { status: 200, headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' } });
+  } catch (e) {
+    return new Response('Process Error: ' + e.message, { status: 500, headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' } });
+  }
+}
+
 // ==================== /fetch 端点（直接返回当前缓存） ====================
 
 async function handleFetch(env, corsHeaders, ctx) {
@@ -401,6 +416,10 @@ async function handleFetch(env, corsHeaders, ctx) {
   try {
     const cached = await env.LINKS_KV.get('cached_aggregate');
     if (cached !== null && cached !== undefined) {
+      // 如果缓存包含未处理项或待重试标记，确保后台任务被触发以继续处理
+      if (ctx && /#未处理|#分析失败-待重试/.test(cached)) {
+        try { ctx.waitUntil(processIpQueue(env)); } catch (e) { console.log('[Fetch] ctx.waitUntil failed:', e.message); }
+      }
       return new Response(cached, {
         headers: { 
           ...corsHeaders, 
@@ -448,6 +467,10 @@ const API_BACKOFF_MS = 60 * 1000; // 1 分钟退避
 const apiUsage = new Map();
 const API_WINDOW_MS = 60 * 1000;
 const API_PRIMARY_LIMIT = 30; // 主 API 每分钟上限（近似）
+
+// 并发自适应参数（Free 计划友好）
+const CONCURRENCY_MIN = 1;
+const CONCURRENCY_MAX = 3;
 
 // 国家代码到中文的映射（常用）
 const countryCodeMap = {
