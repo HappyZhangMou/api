@@ -277,11 +277,11 @@ async function processIpQueue(env) {
         break;
       }
 
-      // 批量查询 IP 归属地
-      for (const item of pendingItems) {
+      // 批量查询 IP 归属地（并发处理以加速完成）
+      const CONCURRENCY = 3; // 并发数（Free 计划下保持较低并发）
+      const processItem = async (item) => {
         let location;
         try {
-          // 清除缓存，强制重新查询（对旧版 #UN未知 尤其重要）
           if (item.isUnknown) {
             const cleanIp = getCleanIp(item.ip);
             ipCache.delete(cleanIp);
@@ -293,21 +293,24 @@ async function processIpQueue(env) {
         }
 
         if (location === 'UN未知') {
-          // 首次失败，标记为 #分析失败-待重试，等待 1 分钟后重试
           lines[item.index] = `${item.line}#分析失败-待重试`;
+          // 使用原子更新计数
           retryLaterCount++;
           console.log(`[Queue] Failed for ${item.ip}: all APIs exhausted, will retry in 1 minute`);
         } else if (location.startsWith('CN')) {
-          // 中国IP，删除该行
           lines[item.index] = null;
           deletedCount++;
           console.log(`[Queue] Deleted ${item.ip}: China IP`);
         } else {
-          // 成功且非中国IP
           lines[item.index] = `${item.line}#${location}`;
           processedCount++;
           console.log(`[Queue] Success for ${item.ip}: ${location}`);
         }
+      };
+
+      for (let i = 0; i < pendingItems.length; i += CONCURRENCY) {
+        const batch = pendingItems.slice(i, i + CONCURRENCY);
+        await Promise.all(batch.map(processItem));
       }
 
       // 批量写回缓存（过滤掉已删除的行）
@@ -361,35 +364,38 @@ async function processIpQueue(env) {
           break;
         }
 
-        for (const item of retryItems) {
-          // 重试时清除缓存，强制重新查询
-          const cleanIp = getCleanIp(item.ip);
-          ipCache.delete(cleanIp);
+          // 并发重试处理（与首次处理相同的并发策略）
+          const CONCURRENCY_RETRY = 3; // 重试并发也设为较低值以适应 Free 计划
+          const processRetryItem = async (item) => {
+            const cleanIp = getCleanIp(item.ip);
+            ipCache.delete(cleanIp);
+            let location;
+            try {
+              location = await getIpLocation(item.ip, env);
+            } catch (e) {
+              console.error(`[Queue Retry] Exception querying ${item.ip}:`, e.message);
+              location = 'UN未知';
+            }
 
-          let location;
-          try {
-            location = await getIpLocation(item.ip, env);
-          } catch (e) {
-            console.error(`[Queue Retry] Exception querying ${item.ip}:`, e.message);
-            location = 'UN未知';
-          }
+            if (location === 'UN未知') {
+              lines[item.index] = `${item.line}#分析失败`;
+              retryFailed++;
+              console.log(`[Queue Retry] Final fail for ${item.ip}: all APIs exhausted after retry`);
+            } else if (location.startsWith('CN')) {
+              lines[item.index] = null;
+              retryDeleted++;
+              console.log(`[Queue Retry] Deleted ${item.ip}: China IP`);
+            } else {
+              lines[item.index] = `${item.line}#${location}`;
+              retryProcessed++;
+              console.log(`[Queue Retry] Success for ${item.ip}: ${location}`);
+            }
+          };
 
-          if (location === 'UN未知') {
-            // 重试仍然失败，标记为最终 #分析失败
-            lines[item.index] = `${item.line}#分析失败`;
-            retryFailed++;
-            console.log(`[Queue Retry] Final fail for ${item.ip}: all APIs exhausted after retry`);
-          } else if (location.startsWith('CN')) {
-            // 中国IP，删除该行
-            lines[item.index] = null;
-            retryDeleted++;
-            console.log(`[Queue Retry] Deleted ${item.ip}: China IP`);
-          } else {
-            lines[item.index] = `${item.line}#${location}`;
-            retryProcessed++;
-            console.log(`[Queue Retry] Success for ${item.ip}: ${location}`);
+          for (let i = 0; i < retryItems.length; i += CONCURRENCY_RETRY) {
+            const batch = retryItems.slice(i, i + CONCURRENCY_RETRY);
+            await Promise.all(batch.map(processRetryItem));
           }
-        }
 
         const filteredLines = lines.filter(line => line !== null);
         const metaTs3 = Date.now();
@@ -507,6 +513,11 @@ const ipCache = new Map();
 const apiBackoff = new Map();
 const API_BACKOFF_MS = 60 * 1000; // 1 分钟退避
 
+// 主 API 速率限制（轻量、本实例内）：每分钟可保留调用数
+const apiUsage = new Map();
+const API_WINDOW_MS = 60 * 1000;
+const API_PRIMARY_LIMIT = 30; // 主 API 每分钟上限（近似）
+
 // 国家代码到中文的映射（常用）
 const countryCodeMap = {
   'CN': '中国', 'US': '美国', 'JP': '日本', 'KR': '韩国', 'SG': '新加坡',
@@ -588,6 +599,24 @@ const countryCodeMap = {
     }
 
     try {
+      // 对主 API 做本地速率限制（近似），超出则直接切换到下一个备用 API
+      if (apiName === 'uapis.cn') {
+        const now = Date.now();
+        const usage = apiUsage.get(apiName) || { windowStart: now, count: 0 };
+        if (now - usage.windowStart > API_WINDOW_MS) {
+          usage.windowStart = now;
+          usage.count = 0;
+        }
+        if (usage.count >= API_PRIMARY_LIMIT) {
+          // 标记短期退避并跳到下一个 API
+          apiBackoff.set(apiName, Date.now() + API_BACKOFF_MS);
+          console.log(`[IP API] ${apiName} local rate limit reached, backing off`);
+          continue;
+        }
+        usage.count++;
+        apiUsage.set(apiName, usage);
+      }
+
       const data = await api.handler();
       const extracted = api.extract(data);
       if (extracted) {
