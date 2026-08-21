@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^c:/Users/Administrator/Documents/api-1/\\.venv/Scripts/python\\.exe api_availability_test\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

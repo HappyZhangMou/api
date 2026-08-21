@@ -16,7 +16,7 @@ export default {
     try {
       console.log('[Scheduled] Aggregation started at', new Date().toISOString());
       const output = await aggregateLinks(env, ctx);
-      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+      await writeCachedAggregate(env, output);
       console.log('[Scheduled] Aggregation completed, cached successfully.');
     } catch (e) {
       console.error('[Scheduled] Aggregation failed:', e.message);
@@ -90,7 +90,7 @@ async function handleSave(request, env, ctx, corsHeaders) {
     // 保存后自动刷新缓存（后台处理 IP）
     try {
       const output = await aggregateLinks(env, ctx);
-      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+      await writeCachedAggregate(env, output);
     } catch (e) {
       console.error('Auto refresh after save failed:', e.message);
     }
@@ -182,7 +182,7 @@ async function aggregateLinks(env, ctx) {
   }
 
   // 立即写入缓存，让外部请求可以获取到（带 #未处理 标记）
-  await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: 3600 });
+  await writeCachedAggregate(env, output);
 
   // 4. 启动后台任务：按队列处理 IP 归属地
   if (ctx) {
@@ -190,6 +190,37 @@ async function aggregateLinks(env, ctx) {
   }
 
   return output;
+}
+
+// 辅助：统一写入 cached_aggregate 和 metadata，TTL 设置为 3 小时，返回写入时间戳
+async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
+  try {
+    const now = Date.now();
+    await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: ttl });
+    await env.LINKS_KV.put('cached_aggregate_meta', String(now), { expirationTtl: ttl });
+    return now;
+  } catch (e) {
+    console.error('[Cache] writeCachedAggregate failed:', e.message);
+    throw e;
+  }
+}
+
+// 条件写入：仅当当前缓存元信息时间不晚于 providedMinMeta 时才写入
+async function conditionalWriteCachedAggregate(env, output, providedMinMeta, ttl = 60 * 60 * 3) {
+  try {
+    const currentMetaRaw = await env.LINKS_KV.get('cached_aggregate_meta');
+    const currentMeta = currentMetaRaw ? parseInt(currentMetaRaw, 10) : 0;
+    const minMeta = providedMinMeta || 0;
+    if (currentMeta > minMeta) {
+      console.log('[Cache] conditionalWrite skipped: newer cache exists');
+      return false;
+    }
+    await writeCachedAggregate(env, output, ttl);
+    return true;
+  } catch (e) {
+    console.error('[Cache] conditionalWriteCachedAggregate failed:', e.message);
+    throw e;
+  }
 }
 
 // ==================== 后台 IP 处理队列 ====================
@@ -241,7 +272,7 @@ async function processIpQueue(env) {
         // 没有待处理项，检查是否有因 skipped 修改的行需要写回
         if (skippedCount > 0) {
           const filteredLines = lines.filter(line => line !== null);
-          await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
+          await writeCachedAggregate(env, filteredLines.join('\n'));
         }
         break;
       }
@@ -281,7 +312,9 @@ async function processIpQueue(env) {
 
       // 批量写回缓存（过滤掉已删除的行）
       const filteredLines = lines.filter(line => line !== null);
-      await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
+      // 使用条件写入：传入当前轮次的 meta 时间戳，避免被更早的并发写覆盖
+      const metaTs = Date.now();
+      await conditionalWriteCachedAggregate(env, filteredLines.join('\n'), metaTs);
       batchCount++;
     }
 
@@ -322,7 +355,8 @@ async function processIpQueue(env) {
         if (retryItems.length === 0) {
           if (retrySkipped > 0) {
             const filteredLines = lines.filter(line => line !== null);
-            await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
+            const metaTs2 = Date.now();
+            await conditionalWriteCachedAggregate(env, filteredLines.join('\n'), metaTs2);
           }
           break;
         }
@@ -358,7 +392,8 @@ async function processIpQueue(env) {
         }
 
         const filteredLines = lines.filter(line => line !== null);
-        await env.LINKS_KV.put('cached_aggregate', filteredLines.join('\n'), { expirationTtl: 3600 });
+        const metaTs3 = Date.now();
+        await conditionalWriteCachedAggregate(env, filteredLines.join('\n'), metaTs3);
         retryBatches++;
       }
 
@@ -404,7 +439,7 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
     }
 
     const updated = updatedLines.join('\n');
-    await env.LINKS_KV.put('cached_aggregate', updated, { expirationTtl: 3600 });
+    await writeCachedAggregate(env, updated);
 
     // 启动后台重新处理
     if (ctx) {
@@ -489,40 +524,7 @@ const countryCodeMap = {
   'YE': '也门', 'MO': '澳门'
 };
 
-// IP 查询成功率统计（内存统计，避免频繁 KV 写入导致超限）
-const apiStatsMemory = {
-  'uapis.cn': { success: 0, fail: 0 },
-  'ipwho.is': { success: 0, fail: 0 },
-  'ipinfo.io': { success: 0, fail: 0 },
-  'ifconfig.co': { success: 0, fail: 0 },
-  'api.ip.sb': { success: 0, fail: 0 }
-};
-
-async function incrementApiStat(env, apiName, isSuccess) {
-  if (!apiStatsMemory[apiName]) {
-    apiStatsMemory[apiName] = { success: 0, fail: 0 };
-  }
-  if (isSuccess) {
-    apiStatsMemory[apiName].success++;
-  } else {
-    apiStatsMemory[apiName].fail++;
-  }
-  // 不再写入 KV，完全避免 KV put 消耗
-}
-
-async function getApiStats(env) {
-  return Object.entries(apiStatsMemory).map(([name, s]) => {
-    const total = s.success + s.fail;
-    const rate = total > 0 ? ((s.success / total) * 100).toFixed(1) : '0.0';
-    return { name, success: s.success, fail: s.fail, total, rate };
-  });
-}
-
-async function resetApiStats(env) {
-  for (const key of Object.keys(apiStatsMemory)) {
-    apiStatsMemory[key] = { success: 0, fail: 0 };
-  }
-}
+// IP 成功率统计功能已移除以简化实现并减少内存占用
 
 // 带超时的 fetch 包装器
 async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
@@ -585,13 +587,13 @@ async function getIpLocation(ip, env) {
               else if (/^(中国|China|CN)/.test(region)) code = 'CN';
             }
             const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
-            if (env) await incrementApiStat(env, apiName, true);
+            // 统计功能已移除
             return `${code}${countryName}`;
           }
         }
         throw new Error('No region data');
       } catch (e) {
-        if (env) await incrementApiStat(env, apiName, false);
+        // 统计功能已移除
         throw e;
       }
     },
@@ -607,35 +609,16 @@ async function getIpLocation(ip, env) {
         if (data.country_code || data.country || data.country_code2) {
           const code = data.country_code || data.country_code2 || '';
           const countryName = countryCodeMap[code] || data.country || data.country_name || '未知';
-          if (env) await incrementApiStat(env, apiName, true);
+          // 统计功能已移除
           return `${code}${countryName}`;
         }
         throw new Error('No country data');
       } catch (e) {
-        if (env) await incrementApiStat(env, apiName, false);
+        // 统计功能已移除
         throw e;
       }
     },
-    // ipinfo.io - 备选
-    async () => {
-      const apiName = 'ipinfo.io';
-      try {
-        const response = await fetchWithTimeout(`https://ipinfo.io/${cleanIp}/json`, {
-          cf: { cacheTtl: 86400 }
-        }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.country) {
-          const code = data.country;
-          if (env) await incrementApiStat(env, apiName, true);
-          return `${code}${countryCodeMap[code] || '未知'}`;
-        }
-        throw new Error('No country data');
-      } catch (e) {
-        if (env) await incrementApiStat(env, apiName, false);
-        throw e;
-      }
-    },
+    // ipinfo.io 已移除（可用性测试中表现不稳定）
     // ifconfig.co - 备选
     async () => {
       const apiName = 'ifconfig.co';
@@ -648,12 +631,12 @@ async function getIpLocation(ip, env) {
         if (data.country_iso || data.country) {
           const code = data.country_iso || data.country || '';
           const countryName = countryCodeMap[code] || data.country || '未知';
-          if (env) await incrementApiStat(env, apiName, true);
+          // 统计功能已移除
           return `${code}${countryName}`;
         }
         throw new Error('No country data');
       } catch (e) {
-        if (env) await incrementApiStat(env, apiName, false);
+        // 统计功能已移除
         throw e;
       }
     },
@@ -669,12 +652,12 @@ async function getIpLocation(ip, env) {
         if (data.country_code || data.country) {
           const code = data.country_code || data.country || '';
           const countryName = countryCodeMap[code] || data.country || '未知';
-          if (env) await incrementApiStat(env, apiName, true);
+          // 统计功能已移除
           return `${code}${countryName}`;
         }
         throw new Error('No country data');
       } catch (e) {
-        if (env) await incrementApiStat(env, apiName, false);
+        // 统计功能已移除
         throw e;
       }
     }
@@ -785,23 +768,8 @@ async function handleAdmin(env) {
     cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，失败 ${failed}）`;
   }
   
-  // 获取 API 成功率统计
-  const stats = await getApiStats(env);
-  const statsHtml = stats.map(s => {
-    const barWidth = s.total > 0 ? s.rate : 0;
-    const barColor = parseFloat(s.rate) >= 80 ? '#4caf50' : (parseFloat(s.rate) >= 50 ? '#ff9800' : '#f44336');
-    return `
-      <div class="api-stat-item">
-        <div class="api-stat-header">
-          <span class="api-name">${s.name}</span>
-          <span class="api-rate">${s.rate}%</span>
-        </div>
-        <div class="api-bar-bg">
-          <div class="api-bar-fill" style="width: ${barWidth}%; background: ${barColor};"></div>
-        </div>
-        <div class="api-stat-detail">成功 ${s.success} / 失败 ${s.fail} / 总计 ${s.total}</div>
-      </div>`;
-  }).join('');
+  // API 成功率统计功能已移除
+  const statsHtml = '';
   
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -813,7 +781,7 @@ async function handleAdmin(env) {
     * { box-sizing: border-box; }
     body { 
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-      max-width: 900px; 
+        // 每3小时触发聚合（需在 wrangler.toml 配置 crons = ["0 */3 * * *"]）
       margin: 40px auto; 
       padding: 20px; 
       background: #f5f5f5;
@@ -841,60 +809,7 @@ async function handleAdmin(env) {
       font-family: monospace;
       border: 1px solid #bbdefb;
     }
-    .api-stats {
-      background: #e8f5e9;
-      padding: 15px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      font-size: 14px;
-      color: #2e7d32;
-    }
-    .api-stats h3 {
-      margin: 0 0 12px 0;
-      font-size: 15px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .api-stats h3::before {
-      content: "📊";
-    }
-    .api-stat-item {
-      margin-bottom: 10px;
-    }
-    .api-stat-item:last-child {
-      margin-bottom: 0;
-    }
-    .api-stat-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 4px;
-    }
-    .api-name {
-      font-weight: 600;
-      color: #1b5e20;
-    }
-    .api-rate {
-      font-weight: 700;
-      font-size: 15px;
-    }
-    .api-bar-bg {
-      height: 8px;
-      background: #c8e6c9;
-      border-radius: 4px;
-      overflow: hidden;
-    }
-    .api-bar-fill {
-      height: 100%;
-      border-radius: 4px;
-      transition: width 0.3s ease;
-    }
-    .api-stat-detail {
-      font-size: 12px;
-      color: #558b2f;
-      margin-top: 3px;
-    }
+    /* API 查询成功率样式已移除 */
     .cache-status {
       background: #f3e5f5;
       padding: 12px 15px;
@@ -1002,10 +917,7 @@ async function handleAdmin(env) {
       <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）
     </div>
 
-    <div class="api-stats">
-      <h3>API 查询成功率</h3>
-      ${statsHtml}
-    </div>
+    <!-- API 查询成功率板块已移除 -->
 
     <div class="cache-status">
       <strong>缓存状态：</strong>${cacheInfo} &nbsp;|&nbsp; 每整点自动更新

@@ -3,7 +3,8 @@ main = "work.js"
 compatibility_date = "2024-01-01"
 
 [triggers]
-crons = ["0 * * * *"]
+# 每 3 小时整点执行一次
+crons = ["0 */3 * * *"]
 
 [[kv_namespaces]]
 binding = "LINKS_KV"
