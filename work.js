@@ -49,7 +49,7 @@ async function handleRequest(request, env, ctx) {
   }
 
   if (url.pathname === '/fetch') {
-    return handleFetch(env, corsHeaders);
+    return handleFetch(env, corsHeaders, ctx);
   }
 
   if (url.pathname === '/retry-failed' && request.method === 'POST') {
@@ -65,7 +65,7 @@ async function handleRequest(request, env, ctx) {
     if (isBrowser) {
       return handleAdmin(env);
     } else {
-      return handleFetch(env, corsHeaders);
+      return handleFetch(env, corsHeaders, ctx);
     }
   }
 
@@ -459,7 +459,7 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
 
 // ==================== /fetch 端点（直接返回当前缓存） ====================
 
-async function handleFetch(env, corsHeaders) {
+async function handleFetch(env, corsHeaders, ctx) {
   // 始终直接返回当前缓存内容（可能包含 #未处理、已完成分析、#分析失败 的混合状态）
   try {
     const cached = await env.LINKS_KV.get('cached_aggregate');
@@ -479,7 +479,9 @@ async function handleFetch(env, corsHeaders) {
   
   // 缓存完全不存在，实时聚合（同步模式，无后台处理）
   try {
-    const output = await aggregateLinks(env, null);
+    // 缓存不存在：同步聚合并在有 ctx 时启动后台 IP 处理
+    const output = await aggregateLinks(env, ctx);
+    // aggregateLinks 会写入缓存并在有 ctx 时启动后台处理
     return new Response(output, {
       headers: { 
         ...corsHeaders, 
