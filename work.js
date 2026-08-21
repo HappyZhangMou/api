@@ -241,12 +241,19 @@ async function processIpQueue(env) {
     const MAX_BATCH = 20; // 每批处理 20 个 IP 再写回 KV
     const RETRY_DELAY_MS = 5 * 60 * 1000; // 标记为待重试的项，5 分钟后可再次处理
 
+    // 并发自适应当前值（每轮初始为最小并发）
+    let concurrencyCurrent = CONCURRENCY_MIN;
     while (true) {
       // 读取当前缓存
       const current = await env.LINKS_KV.get('cached_aggregate');
       if (!current) break;
       const lines = current.split('\n');
       console.log(`[Queue] Starting batch loop; total lines: ${lines.length}`);
+        // 输出首 20 条未处理/待重试行，便于快速定位格式或内容问题
+        const pendingPreview = lines.filter(l => /#未处理|#分析失败-待重试/.test(l)).slice(0, 20);
+        if (pendingPreview.length) {
+          console.log('[Queue] Pending preview (first 20):', pendingPreview.join(' | '));
+        }
       const pendingItems = [];
 
       // 收集本批次待处理的项（#未处理、带时间戳的 #分析失败-待重试@ts，或旧版 #UN未知）
@@ -295,8 +302,8 @@ async function processIpQueue(env) {
         break;
       }
 
-      // 批量查询 IP 归属地（并发处理以加速完成）
-      const CONCURRENCY = 2; // 并发数（Free 计划下保持更低并发）
+      // 批量查询 IP 归属地（自适应并发）
+      let batchErrorCount = 0;
       const processItem = async (item) => {
         let location;
         try {
@@ -315,6 +322,8 @@ async function processIpQueue(env) {
           lines[item.index] = `${item.line}#分析失败-待重试@${Date.now()}`;
           retryLaterCount++;
           console.log(`[Queue] Failed for ${item.ip}: marked for retry later`);
+          // 记录批次错误
+          batchErrorCount++;
         } else if (location.startsWith('CN')) {
           lines[item.index] = null;
           deletedCount++;
@@ -326,9 +335,20 @@ async function processIpQueue(env) {
         }
       };
 
-      for (let i = 0; i < pendingItems.length; i += CONCURRENCY) {
-        const batch = pendingItems.slice(i, i + CONCURRENCY);
+      // 分片并发执行
+      for (let i = 0; i < pendingItems.length; i += concurrencyCurrent) {
+        const batch = pendingItems.slice(i, i + concurrencyCurrent);
+        // 每个批次统计错误数并据此调整 concurrencyCurrent
+        batchErrorCount = 0;
         await Promise.all(batch.map(processItem));
+        // 根据本次子批次的错误情况，上调或下调并发
+        if (batchErrorCount === 0 && concurrencyCurrent < CONCURRENCY_MAX) {
+          concurrencyCurrent++;
+          console.log(`[Queue] Increasing concurrency to ${concurrencyCurrent}`);
+        } else if (batchErrorCount > 0 && concurrencyCurrent > CONCURRENCY_MIN) {
+          concurrencyCurrent--;
+          console.log(`[Queue] Decreasing concurrency to ${concurrencyCurrent}`);
+        }
       }
 
       // 批量写回缓存（过滤掉已删除的行）
@@ -877,6 +897,7 @@ async function handleAdmin(env) {
     <div class="button-row">
       <button onclick="save()" id="saveBtn">保存链接</button>
       <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即刷新缓存</button>
+      <button onclick="processNow()" id="processNowBtn" class="refresh-btn">立即处理</button>
       <button onclick="retryFailed()" id="retryBtn" class="retry-btn">重试分析失败</button>
       <div id="status" class="status"></div>
     </div>
@@ -983,6 +1004,34 @@ async function handleAdmin(env) {
         status.textContent = '✗ 错误: ' + e.message;
       }
       
+      btn.disabled = false;
+    }
+
+    async function processNow() {
+      const btn = document.getElementById('processNowBtn');
+      const status = document.getElementById('status');
+
+      btn.disabled = true;
+      status.style.display = 'none';
+      status.textContent = '请求处理中...';
+      status.className = 'status';
+      status.style.display = 'block';
+
+      try {
+        const res = await fetch('/process-now', { method: 'POST' });
+        const text = await res.text();
+        if (res.ok) {
+          status.className = 'status success';
+          status.textContent = '✓ ' + text;
+        } else {
+          status.className = 'status error';
+          status.textContent = '✗ 处理失败: ' + text;
+        }
+      } catch (e) {
+        status.className = 'status error';
+        status.textContent = '✗ 错误: ' + e.message;
+      }
+
       btn.disabled = false;
     }
   </script>
