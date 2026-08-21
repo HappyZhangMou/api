@@ -537,70 +537,64 @@ const countryCodeMap = {
   'TM': '土库曼', 'MN': '蒙古', 'KP': '朝鲜', 'BD': '孟加拉', 'LK': '斯里兰卡',
   'NP': '尼泊尔', 'BT': '不丹', 'MV': '马尔代夫', 'PK': '巴基斯坦', 'AF': '阿富汗',
   'IR': '伊朗', 'IQ': '伊拉克', 'SY': '叙利亚', 'LB': '黎巴嫩', 'JO': '约旦',
-  'PS': '巴勒斯坦', 'KW': '科威特', 'QA': '卡塔尔', 'BH': '巴林', 'OM': '阿曼',
-  // 依次尝试多个 API；优先使用可用性更稳定的公开接口
+  'PS': '巴勒斯坦', 'KW': '科威特', 'QA': '卡塔尔', 'BH': '巴林', 'OM': '阿曼'
+};
+
+// 通用 fetch 带超时封装
+function fetchWithTimeout(resource, options = {}, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    fetch(resource, options).then(resp => {
+      clearTimeout(timer);
+      resolve(resp);
+    }, err => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+// 查询 IP 的地区（带本地速率限制、退避与备用 API 切换）
+async function getIpLocation(ip, env) {
+  const cleanIp = getCleanIp(ip);
+  if (!cleanIp) return 'UN未知';
+  if (ipCache.has(cleanIp)) return ipCache.get(cleanIp);
+
   const apis = [
     {
       name: 'uapis.cn',
-      handler: async () => {
-        const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, { cf: { cacheTtl: 86400 } }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      },
-      extract: (data) => {
-        if (data && data.region) return data.region.trim();
-        return null;
-      },
+      url: `https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`,
+      extract: data => data && data.region ? data.region.trim() : null,
+      timeout: 3000,
+      primary: true
     },
     {
       name: 'ipwho.is',
-      handler: async () => {
-        const response = await fetchWithTimeout(`https://ipwho.is/${cleanIp}?output=json`, { cf: { cacheTtl: 86400 } }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      },
-      extract: (data) => {
-        if (!data) return null;
-        return data.country_code || data.country || data.country_code2 || null;
-      }
+      url: `https://ipwho.is/${cleanIp}?output=json`,
+      extract: data => data ? (data.country_code || data.country || data.country_code2 || null) : null,
+      timeout: 3000
     },
     {
       name: 'ifconfig.co',
-      handler: async () => {
-        const response = await fetchWithTimeout(`https://ifconfig.co/json?ip=${cleanIp}`, { cf: { cacheTtl: 86400 } }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      },
-      extract: (data) => {
-        if (!data) return null;
-        return data.country_iso || data.country || null;
-      }
+      url: `https://ifconfig.co/json?ip=${cleanIp}`,
+      extract: data => data ? (data.country_iso || data.country || null) : null,
+      timeout: 3000
     },
     {
       name: 'api.ip.sb',
-      handler: async () => {
-        const response = await fetchWithTimeout(`https://api.ip.sb/geoip/${cleanIp}`, { cf: { cacheTtl: 86400 } }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      },
-      extract: (data) => {
-        if (!data) return null;
-        return data.country_code || data.country || null;
-      }
+      url: `https://api.ip.sb/geoip/${cleanIp}`,
+      extract: data => data ? (data.country_code || data.country || null) : null,
+      timeout: 3000
     }
   ];
 
   for (const api of apis) {
     const apiName = api.name;
-    // 如果该 API 在退避期，跳过
     const backoffUntil = apiBackoff.get(apiName) || 0;
-    if (backoffUntil > Date.now()) {
-      continue;
-    }
+    if (backoffUntil > Date.now()) continue;
 
     try {
-      // 对主 API 做本地速率限制（近似），超出则直接切换到下一个备用 API
-      if (apiName === 'uapis.cn') {
+      if (api.primary) {
         const now = Date.now();
         const usage = apiUsage.get(apiName) || { windowStart: now, count: 0 };
         if (now - usage.windowStart > API_WINDOW_MS) {
@@ -608,7 +602,6 @@ const countryCodeMap = {
           usage.count = 0;
         }
         if (usage.count >= API_PRIMARY_LIMIT) {
-          // 标记短期退避并跳到下一个 API
           apiBackoff.set(apiName, Date.now() + API_BACKOFF_MS);
           console.log(`[IP API] ${apiName} local rate limit reached, backing off`);
           continue;
@@ -617,10 +610,19 @@ const countryCodeMap = {
         apiUsage.set(apiName, usage);
       }
 
-      const data = await api.handler();
+      const resp = await fetchWithTimeout(api.url, { cf: { cacheTtl: 86400 } }, api.timeout);
+      if (!resp.ok) {
+        if (resp.status === 429) {
+          apiBackoff.set(apiName, Date.now() + API_BACKOFF_MS);
+          console.log(`[IP API] ${apiName} rate-limited (HTTP 429)`);
+          continue;
+        }
+        throw new Error(`HTTP ${resp.status}`);
+      }
+
+      const data = await resp.json().catch(() => null);
       const extracted = api.extract(data);
       if (extracted) {
-        // 对 uapis.cn 做特殊匹配以返回代码+中文名
         if (apiName === 'uapis.cn') {
           let region = extracted;
           let code = 'UN';
@@ -648,57 +650,26 @@ const countryCodeMap = {
           return result;
         }
 
-        // 其他 API 返回 country code 或 country
-        const code = typeof extracted === 'string' ? extracted : '';
-        const countryName = countryCodeMap[code] || (typeof extracted === 'string' ? extracted : '未知');
+        // 其他 API
+        const extractedStr = String(extracted || '').trim();
+        const code = extractedStr.length === 2 ? extractedStr.toUpperCase() : '';
+        const countryName = countryCodeMap[code] || (extractedStr || '未知');
         const result = `${code}${countryName}`;
         ipCache.set(cleanIp, result);
         return result;
       }
-      // 若未提取到数据，则当作失败继续尝试下个 API
     } catch (e) {
       const msg = (e && e.message) ? e.message : '';
-      // 若为速率限制，设置退避并立即尝试下一个备用 API
-      if (msg.includes('429') || /Too Many Requests/i.test(msg)) {
+      if (msg.includes('429') || /Too Many Requests/i.test(msg) || msg === 'timeout') {
         apiBackoff.set(apiName, Date.now() + API_BACKOFF_MS);
-        console.log(`[IP API] ${apiName} rate-limited, backing off for ${API_BACKOFF_MS}ms`);
+        console.log(`[IP API] ${apiName} rate-limited or timeout, backing off`);
         continue;
       }
-      // 其他错误，记录并继续
       console.error(`[IP API] ${apiName} error:`, msg);
       continue;
     }
   }
-        }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.country_code || data.country) {
-          const code = data.country_code || data.country || '';
-          const countryName = countryCodeMap[code] || data.country || '未知';
-          // 统计功能已移除
-          return `${code}${countryName}`;
-        }
-        throw new Error('No country data');
-      } catch (e) {
-        // 统计功能已移除
-        throw e;
-      }
-    }
-  ];
-  
-  for (const api of apis) {
-    try {
-      const result = await api();
-      if (result === 'UN未知') {
-        continue;
-      }
-      ipCache.set(cleanIp, result);
-      return result;
-    } catch (e) {
-      continue;
-    }
-  }
-  
+
   const result = 'UN未知';
   ipCache.set(cleanIp, result);
   return result;
@@ -804,7 +775,7 @@ async function handleAdmin(env) {
     * { box-sizing: border-box; }
     body { 
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-        // 每3小时触发聚合（需在 wrangler.toml 配置 crons = ["0 */3 * * *"]）
+      /* 每3小时触发聚合（需在 wrangler.toml 配置 crons = ["0 */3 * * *"]） */
       margin: 40px auto; 
       padding: 20px; 
       background: #f5f5f5;
@@ -934,7 +905,7 @@ async function handleAdmin(env) {
     <h1>🔗 链接聚合管理</h1>
     
     <div class="info">
-      <strong>API 端点：</strong>程序请访问 <code>/fetch</code> 获取汇总后的内容<br>
+      <strong>API 端点：</strong>请访问 <code>/fetch</code> 获取汇总后的内容<br>
       <strong>智能访问：</strong>直接 curl 根域名也会自动返回汇总内容<br>
       <strong>自动去重：</strong>多个链接返回的相同内容会自动去重，保留首次出现的顺序<br>
       <strong>IP 地区分析：</strong>自动识别每行中的 IP 地址并标注所属国家（如 <code>#CN中国</code>）
@@ -967,7 +938,7 @@ async function handleAdmin(env) {
         <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
         <li><span class="badge badge-new">NEW</span> <strong>后台异步处理：</strong>时间触发器触发后，先快速返回带 <code>#未处理</code> 标记的结果，之后在后台逐个分析 IP 归属地，成功替换为实际地区，失败标记 <code>#分析失败</code></li>
         <li><span class="badge badge-new">NEW</span> <strong>实时进度：</strong>后台处理期间，外部请求直接返回当前处理进度（已处理 / 未处理 / 分析失败）</li>
-        <li><span class=\"badge badge-new\">NEW</span> <strong>重试失败：</strong>如果某些 IP 分析失败，可点击「重试分析失败」按钮，将这些 IP 重新标记为 <code>#未处理</code> 并再次进入分析流程</li>
+        <li><span class="badge badge-new">NEW</span> <strong>重试失败：</strong>如果某些 IP 分析失败，可点击「重试分析失败」按钮，将这些 IP 重新标记为 <code>#未处理</code> 并再次进入分析流程</li>
         <li>示例输出：<code>192.168.1.1:8080#CN中国</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#分析失败</code></li>
       </ul>
     </div>
