@@ -503,6 +503,10 @@ async function handleFetch(env, corsHeaders, ctx) {
 // IP 缓存，避免重复查询
 const ipCache = new Map();
 
+// API 退避（当某个 API 返回 429 时，记录退避到期时间）
+const apiBackoff = new Map();
+const API_BACKOFF_MS = 60 * 1000; // 1 分钟退避
+
 // 国家代码到中文的映射（常用）
 const countryCodeMap = {
   'CN': '中国', 'US': '美国', 'JP': '日本', 'KR': '韩国', 'SG': '新加坡',
@@ -523,131 +527,119 @@ const countryCodeMap = {
   'NP': '尼泊尔', 'BT': '不丹', 'MV': '马尔代夫', 'PK': '巴基斯坦', 'AF': '阿富汗',
   'IR': '伊朗', 'IQ': '伊拉克', 'SY': '叙利亚', 'LB': '黎巴嫩', 'JO': '约旦',
   'PS': '巴勒斯坦', 'KW': '科威特', 'QA': '卡塔尔', 'BH': '巴林', 'OM': '阿曼',
-  'YE': '也门', 'MO': '澳门'
-};
-
-// IP 成功率统计功能已移除以简化实现并减少内存占用
-
-// 带超时的 fetch 包装器
-async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timeoutId);
-    return response;
-  } catch (e) {
-    clearTimeout(timeoutId);
-    throw e;
-  }
-}
-
-// 查询 IP 地区信息（使用 uapis.cn 作为首选接口）
-async function getIpLocation(ip, env) {
-  // 清理 IP（去掉端口等）
-  const cleanIp = getCleanIp(ip);
-  
-  // 检查缓存
-  if (ipCache.has(cleanIp)) {
-    return ipCache.get(cleanIp);
-  }
-  
   // 依次尝试多个 API；优先使用可用性更稳定的公开接口
   const apis = [
-    // uapis.cn - 首选，返回中文地区信息更完整
-    async () => {
-      const apiName = 'uapis.cn';
-      try {
-        const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, {
-          cf: { cacheTtl: 86400 }
-        }, 3000);
+    {
+      name: 'uapis.cn',
+      handler: async () => {
+        const response = await fetchWithTimeout(`https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`, { cf: { cacheTtl: 86400 } }, 3000);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.region) {
-          const region = data.region.trim();
-          if (region) {
-            let code = 'UN';
-            for (const [k, v] of Object.entries(countryCodeMap)) {
-              if (region.includes(v)) {
-                code = k;
-                break;
-              }
-            }
-            if (code === 'UN') {
-              if (/^(美国|USA?|United States)/.test(region)) code = 'US';
-              else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
-              else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
-              else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
-              else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
-              else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
-              else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
-              else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
-              else if (/^(法国|France|FR)/.test(region)) code = 'FR';
-              else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
-              else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
-              else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
-              else if (/^(中国|China|CN)/.test(region)) code = 'CN';
-            }
-            const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
-            // 统计功能已移除
-            return `${code}${countryName}`;
+        return await response.json();
+      },
+      extract: (data) => {
+        if (data && data.region) return data.region.trim();
+        return null;
+      },
+    },
+    {
+      name: 'ipwho.is',
+      handler: async () => {
+        const response = await fetchWithTimeout(`https://ipwho.is/${cleanIp}?output=json`, { cf: { cacheTtl: 86400 } }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+      },
+      extract: (data) => {
+        if (!data) return null;
+        return data.country_code || data.country || data.country_code2 || null;
+      }
+    },
+    {
+      name: 'ifconfig.co',
+      handler: async () => {
+        const response = await fetchWithTimeout(`https://ifconfig.co/json?ip=${cleanIp}`, { cf: { cacheTtl: 86400 } }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+      },
+      extract: (data) => {
+        if (!data) return null;
+        return data.country_iso || data.country || null;
+      }
+    },
+    {
+      name: 'api.ip.sb',
+      handler: async () => {
+        const response = await fetchWithTimeout(`https://api.ip.sb/geoip/${cleanIp}`, { cf: { cacheTtl: 86400 } }, 3000);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+      },
+      extract: (data) => {
+        if (!data) return null;
+        return data.country_code || data.country || null;
+      }
+    }
+  ];
+
+  for (const api of apis) {
+    const apiName = api.name;
+    // 如果该 API 在退避期，跳过
+    const backoffUntil = apiBackoff.get(apiName) || 0;
+    if (backoffUntil > Date.now()) {
+      continue;
+    }
+
+    try {
+      const data = await api.handler();
+      const extracted = api.extract(data);
+      if (extracted) {
+        // 对 uapis.cn 做特殊匹配以返回代码+中文名
+        if (apiName === 'uapis.cn') {
+          let region = extracted;
+          let code = 'UN';
+          for (const [k, v] of Object.entries(countryCodeMap)) {
+            if (region.includes(v)) { code = k; break; }
           }
+          if (code === 'UN') {
+            if (/^(美国|USA?|United States)/.test(region)) code = 'US';
+            else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
+            else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
+            else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
+            else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
+            else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
+            else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
+            else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
+            else if (/^(法国|France|FR)/.test(region)) code = 'FR';
+            else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
+            else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
+            else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
+            else if (/^(中国|China|CN)/.test(region)) code = 'CN';
+          }
+          const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
+          const result = `${code}${countryName}`;
+          ipCache.set(cleanIp, result);
+          return result;
         }
-        throw new Error('No region data');
-      } catch (e) {
-        // 统计功能已移除
-        throw e;
+
+        // 其他 API 返回 country code 或 country
+        const code = typeof extracted === 'string' ? extracted : '';
+        const countryName = countryCodeMap[code] || (typeof extracted === 'string' ? extracted : '未知');
+        const result = `${code}${countryName}`;
+        ipCache.set(cleanIp, result);
+        return result;
       }
-    },
-    // ipwho.is - 备选，返回稳定的 country_code
-    async () => {
-      const apiName = 'ipwho.is';
-      try {
-        const response = await fetchWithTimeout(`https://ipwho.is/${cleanIp}?output=json`, {
-          cf: { cacheTtl: 86400 }
-        }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.country_code || data.country || data.country_code2) {
-          const code = data.country_code || data.country_code2 || '';
-          const countryName = countryCodeMap[code] || data.country || data.country_name || '未知';
-          // 统计功能已移除
-          return `${code}${countryName}`;
-        }
-        throw new Error('No country data');
-      } catch (e) {
-        // 统计功能已移除
-        throw e;
+      // 若未提取到数据，则当作失败继续尝试下个 API
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : '';
+      // 若为速率限制，设置退避并立即尝试下一个备用 API
+      if (msg.includes('429') || /Too Many Requests/i.test(msg)) {
+        apiBackoff.set(apiName, Date.now() + API_BACKOFF_MS);
+        console.log(`[IP API] ${apiName} rate-limited, backing off for ${API_BACKOFF_MS}ms`);
+        continue;
       }
-    },
-    // ipinfo.io 已移除（可用性测试中表现不稳定）
-    // ifconfig.co - 备选
-    async () => {
-      const apiName = 'ifconfig.co';
-      try {
-        const response = await fetchWithTimeout(`https://ifconfig.co/json?ip=${cleanIp}`, {
-          cf: { cacheTtl: 86400 }
-        }, 3000);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
-        if (data.country_iso || data.country) {
-          const code = data.country_iso || data.country || '';
-          const countryName = countryCodeMap[code] || data.country || '未知';
-          // 统计功能已移除
-          return `${code}${countryName}`;
-        }
-        throw new Error('No country data');
-      } catch (e) {
-        // 统计功能已移除
-        throw e;
-      }
-    },
-    // api.ip.sb - 最后备选
-    async () => {
-      const apiName = 'api.ip.sb';
-      try {
-        const response = await fetchWithTimeout(`https://api.ip.sb/geoip/${cleanIp}`, {
-          cf: { cacheTtl: 86400 }
+      // 其他错误，记录并继续
+      console.error(`[IP API] ${apiName} error:`, msg);
+      continue;
+    }
+  }
         }, 3000);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
