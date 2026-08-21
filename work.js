@@ -233,7 +233,9 @@ async function processIpQueue(env) {
     let retryLaterCount = 0;
     let deletedCount = 0;
     let batchCount = 0;
-    const MAX_BATCH = 100; // 每批处理 100 个 IP 再写回 KV，大幅减少 KV 操作次数
+    // Free 计划友好设置：较小批次与并发，避免长时间执行和大量外部请求
+    const MAX_BATCH = 20; // 每批处理 20 个 IP 再写回 KV
+    const RETRY_DELAY_MS = 5 * 60 * 1000; // 标记为待重试的项，5 分钟后可再次处理
 
     while (true) {
       // 读取当前缓存
@@ -243,7 +245,7 @@ async function processIpQueue(env) {
       const lines = current.split('\n');
       const pendingItems = [];
 
-      // 收集本批次待处理的项（#未处理 或旧版 #UN未知）
+      // 收集本批次待处理的项（#未处理、带时间戳的 #分析失败-待重试@ts，或旧版 #UN未知）
       for (let i = 0; i < lines.length && pendingItems.length < MAX_BATCH; i++) {
         const line = lines[i];
         let contentWithoutMark = null;
@@ -251,9 +253,21 @@ async function processIpQueue(env) {
 
         if (line.endsWith('#未处理')) {
           contentWithoutMark = line.slice(0, -4); // 去掉 #未处理（4个字符）
-        } else if (line.endsWith('#UN未知')) {
-          contentWithoutMark = line.slice(0, -5); // 去掉 #UN未知（5个字符）
-          isUnknown = true;
+        } else {
+          // 匹配带时间戳的待重试标记：#分析失败-待重试@<ts>
+          const retryMatch = line.match(/^(.*)#分析失败-待重试(?:@(\d+))?$/);
+          if (retryMatch) {
+            const ts = retryMatch[2] ? parseInt(retryMatch[2], 10) : 0;
+            if (!ts || ts <= Date.now() - RETRY_DELAY_MS) {
+              contentWithoutMark = retryMatch[1];
+            } else {
+              // 尚未到重试时间，跳过
+              continue;
+            }
+          } else if (line.endsWith('#UN未知')) {
+            contentWithoutMark = line.slice(0, -5); // 去掉 #UN未知（5个字符）
+            isUnknown = true;
+          }
         }
 
         if (contentWithoutMark !== null) {
@@ -278,7 +292,7 @@ async function processIpQueue(env) {
       }
 
       // 批量查询 IP 归属地（并发处理以加速完成）
-      const CONCURRENCY = 3; // 并发数（Free 计划下保持较低并发）
+      const CONCURRENCY = 2; // 并发数（Free 计划下保持更低并发）
       const processItem = async (item) => {
         let location;
         try {
@@ -293,10 +307,10 @@ async function processIpQueue(env) {
         }
 
         if (location === 'UN未知') {
-          lines[item.index] = `${item.line}#分析失败-待重试`;
-          // 使用原子更新计数
+          // 标记为待重试并附带时间戳，避免在当前执行中阻塞等待重试
+          lines[item.index] = `${item.line}#分析失败-待重试@${Date.now()}`;
           retryLaterCount++;
-          console.log(`[Queue] Failed for ${item.ip}: all APIs exhausted, will retry in 1 minute`);
+          console.log(`[Queue] Failed for ${item.ip}: marked for retry later`);
         } else if (location.startsWith('CN')) {
           lines[item.index] = null;
           deletedCount++;
@@ -320,93 +334,8 @@ async function processIpQueue(env) {
       await conditionalWriteCachedAggregate(env, filteredLines.join('\n'), metaTs);
       batchCount++;
     }
-
-    console.log(`[Queue] First pass completed. Batches: ${batchCount}, Processed: ${processedCount}, Failed: ${retryLaterCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
-
-    // 第二轮：重试 #分析失败-待重试 的项（等待 1 分钟后）
-    let retryProcessed = 0;
-    let retryFailed = 0;
-    let retryDeleted = 0;
-    let retryBatches = 0;
-    
-    if (retryLaterCount > 0) {
-      console.log('[Queue] Waiting 1 minute before retrying failed items...');
-      await sleep(60000);
-
-      while (true) {
-        const current = await env.LINKS_KV.get('cached_aggregate');
-        if (!current) break;
-
-        const lines = current.split('\n');
-        const retryItems = [];
-        let retrySkipped = 0;
-
-        for (let i = 0; i < lines.length && retryItems.length < MAX_BATCH; i++) {
-          const line = lines[i];
-          if (line.endsWith('#分析失败-待重试')) {
-            const contentWithoutMark = line.slice(0, -9); // 去掉 #分析失败-待重试（9个字符）
-            const ip = extractIp(contentWithoutMark);
-            if (ip) {
-              retryItems.push({ index: i, line: contentWithoutMark, ip });
-            } else {
-              lines[i] = contentWithoutMark;
-              retrySkipped++;
-            }
-          }
-        }
-
-        if (retryItems.length === 0) {
-          if (retrySkipped > 0) {
-            const filteredLines = lines.filter(line => line !== null);
-            const metaTs2 = Date.now();
-            await conditionalWriteCachedAggregate(env, filteredLines.join('\n'), metaTs2);
-          }
-          break;
-        }
-
-          // 并发重试处理（与首次处理相同的并发策略）
-          const CONCURRENCY_RETRY = 3; // 重试并发也设为较低值以适应 Free 计划
-          const processRetryItem = async (item) => {
-            const cleanIp = getCleanIp(item.ip);
-            ipCache.delete(cleanIp);
-            let location;
-            try {
-              location = await getIpLocation(item.ip, env);
-            } catch (e) {
-              console.error(`[Queue Retry] Exception querying ${item.ip}:`, e.message);
-              location = 'UN未知';
-            }
-
-            if (location === 'UN未知') {
-              lines[item.index] = `${item.line}#分析失败`;
-              retryFailed++;
-              console.log(`[Queue Retry] Final fail for ${item.ip}: all APIs exhausted after retry`);
-            } else if (location.startsWith('CN')) {
-              lines[item.index] = null;
-              retryDeleted++;
-              console.log(`[Queue Retry] Deleted ${item.ip}: China IP`);
-            } else {
-              lines[item.index] = `${item.line}#${location}`;
-              retryProcessed++;
-              console.log(`[Queue Retry] Success for ${item.ip}: ${location}`);
-            }
-          };
-
-          for (let i = 0; i < retryItems.length; i += CONCURRENCY_RETRY) {
-            const batch = retryItems.slice(i, i + CONCURRENCY_RETRY);
-            await Promise.all(batch.map(processRetryItem));
-          }
-
-        const filteredLines = lines.filter(line => line !== null);
-        const metaTs3 = Date.now();
-        await conditionalWriteCachedAggregate(env, filteredLines.join('\n'), metaTs3);
-        retryBatches++;
-      }
-
-      console.log(`[Queue] Retry pass completed. Batches: ${retryBatches}, Processed: ${retryProcessed}, Failed: ${retryFailed}, Deleted: ${retryDeleted}`);
-    }
-
-    console.log(`[Queue] All done. Total processed: ${processedCount + retryProcessed}, Total failed: ${retryFailed}, Deleted: ${deletedCount + retryDeleted}, Skipped: ${skippedCount}`);
+    console.log(`[Queue] First pass completed. Batches: ${batchCount}, Processed: ${processedCount}, Marked for retry: ${retryLaterCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
+    console.log('[Queue] Retrying of failed items is deferred; scheduled runs or manual retry will handle them after delay.');
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
   }
@@ -431,9 +360,11 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
     let retryCount = 0;
 
     const updatedLines = lines.map(line => {
-      if (line.endsWith('#分析失败')) {
+      // 支持多种失败标记：#分析失败、#分析失败-待重试 或 带时间戳的 #分析失败-待重试@<ts>
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:@\d+)?)?)$/);
+      if (match) {
         retryCount++;
-        return line.slice(0, -5) + '#未处理'; // 去掉 #分析失败（5个字符），加上 #未处理
+        return match[1] + '#未处理';
       }
       return line;
     });
