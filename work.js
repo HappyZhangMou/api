@@ -364,11 +364,11 @@ async function processIpQueue(env) {
           }
           if (result.startsWith('CN')) return { line: null, deleted: true };
 
-          const speed = await measureVlessSpeed(item.line);
+          const speed = await measureIpConnection(item.line);
           if (speed.error) {
-            return { line: `${item.line}#${result}|测速失败`, speedFailed: true };
+            return { line: `${item.line}#${result}|连接失败`, speedFailed: true };
           }
-          return { line: `${item.line}#${result}|${speed.mbps}mb/s` };
+          return { line: `${item.line}#${result}|${speed.latencyMs}ms` };
         }));
 
         for (let i = 0; i < pendingItems.length; i++) {
@@ -415,7 +415,7 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
 
     const updatedLines = lines.map(line => {
       // 支持多种失败标记：#分析失败、#分析失败-待重试 或 带时间戳的 #分析失败-待重试@<ts>
-      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:@\d+)?)?|#[^#]*\|测速失败)$/);
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:@\d+)?)?|#[^#]*\|连接失败)$/);
       if (match) {
         retryCount++;
         return match[1] + '#未处理';
@@ -448,143 +448,34 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
   }
 }
 
-async function measureVlessSpeed(line) {
-  let parsed;
-  try {
-    parsed = new URL(line);
-  } catch {
-    return { error: '缺少 VLESS URI 凭据' };
-  }
+async function measureIpConnection(line) {
+  const bracketed = line.match(/\[([0-9a-fA-F:]+)\](?::(\d+))?/);
+  const ipv4 = line.match(/\b(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?\b/);
+  const endpoint = bracketed || ipv4;
+  if (!endpoint) return { error: '未找到可测速 IP' };
 
-  const params = parsed.searchParams;
-  const transport = params.get('type') || 'tcp';
-  const security = params.get('security') || 'none';
-  const sni = params.get('sni');
-  if (parsed.protocol !== 'vless:' || transport !== 'tcp' || !['none', 'tls'].includes(security)) {
-    return { error: '仅支持 VLESS TCP/TLS' };
-  }
-  if (params.get('flow') || (security === 'tls' && sni && sni.toLowerCase() !== parsed.hostname.toLowerCase())) {
-    return { error: '不支持该 VLESS flow 或独立 SNI' };
-  }
-
-  let uuid;
-  try {
-    uuid = decodeURIComponent(parsed.username).replace(/-/g, '');
-  } catch {
-    return { error: 'VLESS UUID 编码无效' };
-  }
-  if (!/^[0-9a-f]{32}$/i.test(uuid)) return { error: 'VLESS UUID 无效' };
-
-  const uuidBytes = new Uint8Array(uuid.match(/.{2}/g).map(pair => parseInt(pair, 16)));
-  const destinationHost = 'speedtest.tele2.net';
-  const hostBytes = new TextEncoder().encode(destinationHost);
-  const destinationPort = 80;
-  const request = new Uint8Array([
-    0, ...uuidBytes, 0, 1, destinationPort >> 8, destinationPort & 255,
-    2, hostBytes.length, ...hostBytes
-  ]);
+  const hostname = endpoint[1];
+  const port = Number(endpoint[2] || 443);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return { error: '端口无效' };
 
   let socket;
-  let reader;
+  let timeout;
   const startedAt = Date.now();
-  const timeout = setTimeout(() => socket?.close().catch(() => {}), 12000);
-
   try {
-    socket = connect(
-      { hostname: parsed.hostname.replace(/^\[|\]$/g, ''), port: Number(parsed.port) || 443 },
-      { secureTransport: security === 'tls' ? 'on' : 'off' }
-    );
-    await socket.opened;
-
-    reader = createBufferedReader(socket.readable.getReader());
-    const writer = socket.writable.getWriter();
-    await writer.write(request);
-    writer.releaseLock();
-
-    const responseHeader = await reader.readExact(2);
-    if (responseHeader[0] !== 0) throw new Error('VLESS 响应版本无效');
-    if (responseHeader[1] > 0) await reader.readExact(responseHeader[1]);
-
-    const httpRequest = new TextEncoder().encode(
-      'GET /1MB.zip HTTP/1.1\r\nHost: speedtest.tele2.net\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n'
-    );
-    const httpWriter = socket.writable.getWriter();
-    await httpWriter.write(httpRequest);
-    httpWriter.releaseLock();
-
-    let responseBytes = new Uint8Array(0);
-    let headerEnd = -1;
-    while (responseBytes.length < 65536 && headerEnd < 0) {
-      const chunk = await reader.readChunk();
-      if (chunk.done) throw new Error('测速服务器提前关闭连接');
-      const combined = new Uint8Array(responseBytes.length + chunk.value.length);
-      combined.set(responseBytes);
-      combined.set(chunk.value, responseBytes.length);
-      responseBytes = combined;
-      headerEnd = findHeaderEnd(responseBytes);
-    }
-    if (headerEnd < 0) throw new Error('测速服务器响应头无效');
-
-    const responseText = new TextDecoder().decode(responseBytes.slice(0, headerEnd));
-    const status = Number((responseText.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/) || [])[1]);
-    if (status !== 200) throw new Error(`测速服务器返回 HTTP ${status || '未知'}`);
-
-    const lengthMatch = responseText.match(/\r\ncontent-length:\s*(\d+)/i);
-    const expectedBytes = lengthMatch ? Math.min(Number(lengthMatch[1]), 1024 * 1024) : 1024 * 1024;
-    let downloadedBytes = Math.min(responseBytes.length - headerEnd - 4, expectedBytes);
-    while (downloadedBytes < expectedBytes) {
-      const chunk = await reader.readChunk();
-      if (chunk.done) break;
-      downloadedBytes = Math.min(expectedBytes, downloadedBytes + chunk.value.length);
-    }
-    if (downloadedBytes === 0) throw new Error('测速文件为空');
-
-    const elapsedMs = Math.max(1, Date.now() - startedAt);
-    return { mbps: Number((downloadedBytes * 8 / elapsedMs / 1000).toFixed(2)) };
+    socket = connect({ hostname, port });
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('连接超时')), 3000);
+      })
+    ]);
+    return { latencyMs: Math.max(1, Date.now() - startedAt) };
   } catch (error) {
-    return { error: error.message || '测速失败' };
+    return { error: error.message || '连接失败' };
   } finally {
     clearTimeout(timeout);
-    if (reader) await reader.cancel().catch(() => {});
     if (socket) await socket.close().catch(() => {});
   }
-}
-
-function createBufferedReader(reader) {
-  let buffered = new Uint8Array(0);
-  return {
-    async readExact(length) {
-      while (buffered.length < length) {
-        const chunk = await reader.read();
-        if (chunk.done) throw new Error('VLESS 服务端提前关闭连接');
-        const combined = new Uint8Array(buffered.length + chunk.value.length);
-        combined.set(buffered);
-        combined.set(chunk.value, buffered.length);
-        buffered = combined;
-      }
-      const result = buffered.slice(0, length);
-      buffered = buffered.slice(length);
-      return result;
-    },
-    async readChunk() {
-      if (buffered.length > 0) {
-        const value = buffered;
-        buffered = new Uint8Array(0);
-        return { value, done: false };
-      }
-      return reader.read();
-    },
-    cancel() {
-      return reader.cancel();
-    }
-  };
-}
-
-function findHeaderEnd(bytes) {
-  for (let index = 0; index <= bytes.length - 4; index++) {
-    if (bytes[index] === 13 && bytes[index + 1] === 10 && bytes[index + 2] === 13 && bytes[index + 3] === 10) return index;
-  }
-  return -1;
 }
 
 // 管理端：强制触发后台处理（用于排查和即时处理）
@@ -971,6 +862,7 @@ async function handleAdmin(env) {
     let unprocessed = 0;
     let failed = 0;
     let failedRetry = 0;
+    let connectionFailed = 0;
     
     for (const line of allLines) {
       const trimmed = line.trim();
@@ -980,11 +872,11 @@ async function handleAdmin(env) {
       else if (/#分析失败(?:-待重试(?:@\d+)?)?$/.test(trimmed)) {
         if (trimmed.endsWith('#分析失败')) failed++;
         else failedRetry++;
-      }
+      } else if (trimmed.endsWith('|连接失败')) connectionFailed++;
     }
     
-    const processed = totalLines - unprocessed - failed - failedRetry;
-    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，失败 ${failed}）`;
+    const processed = totalLines - unprocessed - failed - failedRetry - connectionFailed;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，地区失败 ${failed}，连接失败 ${connectionFailed}）`;
   }
   
   // API 成功率统计功能已移除
@@ -1161,12 +1053,12 @@ async function handleAdmin(env) {
         <li>访问 <code>/fetch</code> 时，程序会优先返回缓存内容，响应速度极快</li>
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
-        <li><strong>节点测速：</strong>上游内容变化后会重新测速所有 IP 节点；目前支持 VLESS TCP/TLS（不支持 Reality、WS、gRPC 或独立 SNI），结果格式为 <code>#地区|Mbpsmb/s</code></li>
-        <li>示例输出：<code>1.2.3.4:443#JP日本|12.34mb/s</code>；不支持的协议会显示 <code>|测速失败</code></li>
+        <li><strong>IP 连接延迟：</strong>上游内容变化后会重新测试 IP:端口的 TCP 建连时间，结果格式为 <code>#地区|42ms</code>；Cloudflare 出站策略可能拒绝优选 IP 连接</li>
+        <li>示例输出：<code>1.2.3.4:443#JP日本|42ms</code>；连接失败会显示 <code>|连接失败</code>，此值是 Worker 到 IP 的 TCP 延迟，不是下载速度</li>
         <li><span class="badge badge-new">NEW</span> <strong>后台异步处理：</strong>时间触发器触发后，先快速返回带 <code>#未处理</code> 标记的结果，之后在后台逐个分析 IP 归属地，成功替换为实际地区，失败标记 <code>#分析失败</code></li>
         <li><span class="badge badge-new">NEW</span> <strong>实时进度：</strong>后台处理期间，外部请求直接返回当前处理进度（已处理 / 未处理 / 分析失败）</li>
         <li><span class="badge badge-new">NEW</span> <strong>重试失败：</strong>如果某些 IP 分析失败，可点击「重试分析失败」按钮，将这些 IP 重新标记为 <code>#未处理</code> 并再次进入分析流程</li>
-        <li>示例输出：<code>1.2.3.4:443#JP日本|12.34mb/s</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#分析失败</code></li>
+        <li>示例输出：<code>1.2.3.4:443#JP日本|42ms</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#连接失败</code></li>
       </ul>
     </div>
   </div>
