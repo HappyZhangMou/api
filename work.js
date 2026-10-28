@@ -59,6 +59,10 @@ async function handleRequest(request, env, ctx) {
     return handleFetch(env, corsHeaders, ctx);
   }
 
+  if (url.pathname === '/refresh' && request.method === 'POST') {
+    return handleRefresh(env, ctx, corsHeaders);
+  }
+
   if (url.pathname === '/process-now' && request.method === 'POST') {
     return handleProcessNow(env, ctx, corsHeaders);
   }
@@ -584,6 +588,27 @@ function findHeaderEnd(bytes) {
 }
 
 // 管理端：强制触发后台处理（用于排查和即时处理）
+async function handleRefresh(env, ctx, corsHeaders) {
+  try {
+    const previousHash = await env.LINKS_KV.get('upstream_hash');
+    await aggregateLinks(env, ctx);
+    const currentHash = await env.LINKS_KV.get('upstream_hash');
+    const changed = previousHash !== currentHash;
+    const message = changed
+      ? '上游刷新完成，内容有变化，已重新排队测速。'
+      : '上游刷新完成，内容没有变化，无需重新测速。';
+    return new Response(message, {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  } catch (e) {
+    return new Response('Refresh Error: ' + e.message, {
+      status: 502,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+}
+
 async function handleProcessNow(env, ctx, corsHeaders) {
   try {
     // 启动后台处理但不要阻塞响应
@@ -1122,7 +1147,7 @@ async function handleAdmin(env) {
     
     <div class="button-row">
       <button onclick="save()" id="saveBtn">保存链接</button>
-      <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即刷新缓存</button>
+      <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即拉取并刷新</button>
       <button onclick="processNow()" id="processNowBtn" class="refresh-btn">立即处理</button>
       <button onclick="retryFailed()" id="retryBtn" class="retry-btn">重试分析失败</button>
       <div id="status" class="status"></div>
@@ -1190,12 +1215,12 @@ async function handleAdmin(env) {
       status.style.display = 'block';
       
       try {
-        const res = await fetch('/fetch');
+        const res = await fetch('/refresh', { method: 'POST' });
+        const text = await res.text();
         if (res.ok) {
           status.className = 'status success';
-          status.textContent = '✓ 缓存刷新成功（后台开始处理 IP）';
+          status.textContent = '✓ ' + text;
         } else {
-          const text = await res.text();
           status.className = 'status error';
           status.textContent = '✗ 刷新失败: ' + text;
         }
