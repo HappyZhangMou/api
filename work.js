@@ -1,3 +1,5 @@
+import { connect } from 'cloudflare:sockets';
+
 export default {
   async fetch(request, env, ctx) {
     // 全局兜底：任何异常都返回可读信息，避免 1101
@@ -20,7 +22,7 @@ export default {
         await aggregateLinks(env, ctx);
         console.log('[Scheduled] Aggregation completed.');
       } else {
-        // 每 10 分钟：仅增量处理待处理 IP，不重新拉取上游
+        // 每分钟：仅增量处理待处理节点，不重新拉取上游
         await processIpQueue(env);
       }
     } catch (e) {
@@ -131,23 +133,6 @@ async function aggregateLinks(env, ctx) {
     throw new Error('No valid links found (all lines are empty or comments).');
   }
 
-  // 读取旧缓存，按 IP 建立索引，复用已有的处理结果（避免定期刷新时重复查询）
-  const oldCached = await env.LINKS_KV.get('cached_aggregate');
-  const oldByIp = new Map();
-  if (oldCached) {
-    for (const line of oldCached.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const ip = extractIp(trimmed);
-      if (!ip) continue;
-      const clean = getCleanIp(ip);
-      // 只复用已完成结果（带 #XX 国家标记，且非未处理/失败/未知）
-      if (!oldByIp.has(clean) && /#(?!未处理|分析失败|UN未知)/.test(trimmed)) {
-        oldByIp.set(clean, trimmed);
-      }
-    }
-  }
-
   const seen = new Set();
   const allLines = [];
   let successCount = 0;
@@ -191,18 +176,16 @@ async function aggregateLinks(env, ctx) {
     throw new Error(errorOutput);
   }
 
-  // 2. 增量标记：已有处理结果的 IP 复用旧结果；新/未处理的 IP 标记 #未处理
-  const markedLines = allLines.map(line => {
-    const ip = extractIp(line);
-    if (ip) {
-      const old = oldByIp.get(getCleanIp(ip));
-      if (old) {
-        return old; // 复用旧结果，避免重复查询
-      }
-      return `${line}#未处理`;
-    }
-    return line;
-  });
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(allLines.join('\n')));
+  const upstreamHash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  const [oldCached, oldHash] = await Promise.all([
+    env.LINKS_KV.get('cached_aggregate'),
+    env.LINKS_KV.get('upstream_hash')
+  ]);
+  if (oldCached && oldHash === upstreamHash) return oldCached;
+
+  // 上游内容有变化时，所有节点重新入队，包括已存在测速结果的 IP。
+  const markedLines = allLines.map(line => extractIp(line) ? `${line}#未处理` : line);
 
   // 3. 组装初始输出并立即写入缓存
   let output = markedLines.join('\n');
@@ -212,6 +195,7 @@ async function aggregateLinks(env, ctx) {
 
   // 立即写入缓存，让外部请求可以获取到（带 #未处理 标记）
   await writeCachedAggregate(env, output);
+  await env.LINKS_KV.put('upstream_hash', upstreamHash);
 
   // 4. 启动后台任务：按队列处理 IP 归属地
   if (ctx) {
@@ -274,6 +258,7 @@ async function processIpQueue(env) {
     let failedCount = 0;
     let deletedCount = 0;
     let skippedCount = 0;
+    let speedFailedCount = 0;
 
     try {
       const current = await env.LINKS_KV.get('cached_aggregate');
@@ -282,8 +267,8 @@ async function processIpQueue(env) {
 
       const pendingItems = [];
       let changed = false;
-      // 批量接口每分钟最多处理 BATCH_MAX_IPS * BATCH_LIMIT_PER_MIN 个 IP
-      const MAX_PER_RUN = BATCH_MAX_IPS * BATCH_LIMIT_PER_MIN;
+      // 每轮只测少量节点，避免单次定时任务占用过久。
+      const MAX_PER_RUN = 4;
 
       // 收集本轮待处理项
       for (let i = 0; i < lines.length && pendingItems.length < MAX_PER_RUN; i++) {
@@ -367,19 +352,28 @@ async function processIpQueue(env) {
           if (r.result !== 'UN未知') resolved.set(ip, r.result);
         }
 
-        // 应用结果
-        for (const item of pendingItems) {
+        const itemResults = await Promise.all(pendingItems.map(async item => {
           const clean = getCleanIp(item.ip);
           const result = resolved.get(clean);
           if (result === undefined) {
-            lines[item.index] = `${item.line}#分析失败-待重试@${Date.now()}`;
-            failedCount++;
-          } else if (result.startsWith('CN')) {
-            lines[item.index] = null;
-            deletedCount++;
-          } else {
-            lines[item.index] = `${item.line}#${result}`;
+            return { line: `${item.line}#分析失败-待重试@${Date.now()}`, failed: true };
+          }
+          if (result.startsWith('CN')) return { line: null, deleted: true };
+
+          const speed = await measureVlessSpeed(item.line);
+          if (speed.error) {
+            return { line: `${item.line}#${result}|测速失败`, speedFailed: true };
+          }
+          return { line: `${item.line}#${result}|${speed.mbps}mb/s` };
+        }));
+
+        for (let i = 0; i < pendingItems.length; i++) {
+          lines[pendingItems[i].index] = itemResults[i].line;
+          if (itemResults[i].failed) failedCount++;
+          else if (itemResults[i].deleted) deletedCount++;
+          else {
             processedCount++;
+            if (itemResults[i].speedFailed) speedFailedCount++;
           }
         }
       }
@@ -388,7 +382,7 @@ async function processIpQueue(env) {
       const filteredLines = lines.filter(line => line !== null);
       await writeCachedAggregate(env, filteredLines.join('\n'));
 
-      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Failed(retry later): ${failedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
+      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
     } finally {
       await releaseLock(env);
     }
@@ -417,7 +411,7 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
 
     const updatedLines = lines.map(line => {
       // 支持多种失败标记：#分析失败、#分析失败-待重试 或 带时间戳的 #分析失败-待重试@<ts>
-      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:@\d+)?)?)$/);
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:@\d+)?)?|#[^#]*\|测速失败)$/);
       if (match) {
         retryCount++;
         return match[1] + '#未处理';
@@ -448,6 +442,145 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
     });
   }
+}
+
+async function measureVlessSpeed(line) {
+  let parsed;
+  try {
+    parsed = new URL(line);
+  } catch {
+    return { error: '缺少 VLESS URI 凭据' };
+  }
+
+  const params = parsed.searchParams;
+  const transport = params.get('type') || 'tcp';
+  const security = params.get('security') || 'none';
+  const sni = params.get('sni');
+  if (parsed.protocol !== 'vless:' || transport !== 'tcp' || !['none', 'tls'].includes(security)) {
+    return { error: '仅支持 VLESS TCP/TLS' };
+  }
+  if (params.get('flow') || (security === 'tls' && sni && sni.toLowerCase() !== parsed.hostname.toLowerCase())) {
+    return { error: '不支持该 VLESS flow 或独立 SNI' };
+  }
+
+  let uuid;
+  try {
+    uuid = decodeURIComponent(parsed.username).replace(/-/g, '');
+  } catch {
+    return { error: 'VLESS UUID 编码无效' };
+  }
+  if (!/^[0-9a-f]{32}$/i.test(uuid)) return { error: 'VLESS UUID 无效' };
+
+  const uuidBytes = new Uint8Array(uuid.match(/.{2}/g).map(pair => parseInt(pair, 16)));
+  const destinationHost = 'speedtest.tele2.net';
+  const hostBytes = new TextEncoder().encode(destinationHost);
+  const destinationPort = 80;
+  const request = new Uint8Array([
+    0, ...uuidBytes, 0, 1, destinationPort >> 8, destinationPort & 255,
+    2, hostBytes.length, ...hostBytes
+  ]);
+
+  let socket;
+  let reader;
+  const startedAt = Date.now();
+  const timeout = setTimeout(() => socket?.close().catch(() => {}), 12000);
+
+  try {
+    socket = connect(
+      { hostname: parsed.hostname.replace(/^\[|\]$/g, ''), port: Number(parsed.port) || 443 },
+      { secureTransport: security === 'tls' ? 'on' : 'off' }
+    );
+    await socket.opened;
+
+    reader = createBufferedReader(socket.readable.getReader());
+    const writer = socket.writable.getWriter();
+    await writer.write(request);
+    writer.releaseLock();
+
+    const responseHeader = await reader.readExact(2);
+    if (responseHeader[0] !== 0) throw new Error('VLESS 响应版本无效');
+    if (responseHeader[1] > 0) await reader.readExact(responseHeader[1]);
+
+    const httpRequest = new TextEncoder().encode(
+      'GET /1MB.zip HTTP/1.1\r\nHost: speedtest.tele2.net\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n'
+    );
+    const httpWriter = socket.writable.getWriter();
+    await httpWriter.write(httpRequest);
+    httpWriter.releaseLock();
+
+    let responseBytes = new Uint8Array(0);
+    let headerEnd = -1;
+    while (responseBytes.length < 65536 && headerEnd < 0) {
+      const chunk = await reader.readChunk();
+      if (chunk.done) throw new Error('测速服务器提前关闭连接');
+      const combined = new Uint8Array(responseBytes.length + chunk.value.length);
+      combined.set(responseBytes);
+      combined.set(chunk.value, responseBytes.length);
+      responseBytes = combined;
+      headerEnd = findHeaderEnd(responseBytes);
+    }
+    if (headerEnd < 0) throw new Error('测速服务器响应头无效');
+
+    const responseText = new TextDecoder().decode(responseBytes.slice(0, headerEnd));
+    const status = Number((responseText.match(/^HTTP\/\d(?:\.\d)?\s+(\d+)/) || [])[1]);
+    if (status !== 200) throw new Error(`测速服务器返回 HTTP ${status || '未知'}`);
+
+    const lengthMatch = responseText.match(/\r\ncontent-length:\s*(\d+)/i);
+    const expectedBytes = lengthMatch ? Math.min(Number(lengthMatch[1]), 1024 * 1024) : 1024 * 1024;
+    let downloadedBytes = Math.min(responseBytes.length - headerEnd - 4, expectedBytes);
+    while (downloadedBytes < expectedBytes) {
+      const chunk = await reader.readChunk();
+      if (chunk.done) break;
+      downloadedBytes = Math.min(expectedBytes, downloadedBytes + chunk.value.length);
+    }
+    if (downloadedBytes === 0) throw new Error('测速文件为空');
+
+    const elapsedMs = Math.max(1, Date.now() - startedAt);
+    return { mbps: Number((downloadedBytes * 8 / elapsedMs / 1000).toFixed(2)) };
+  } catch (error) {
+    return { error: error.message || '测速失败' };
+  } finally {
+    clearTimeout(timeout);
+    if (reader) await reader.cancel().catch(() => {});
+    if (socket) await socket.close().catch(() => {});
+  }
+}
+
+function createBufferedReader(reader) {
+  let buffered = new Uint8Array(0);
+  return {
+    async readExact(length) {
+      while (buffered.length < length) {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error('VLESS 服务端提前关闭连接');
+        const combined = new Uint8Array(buffered.length + chunk.value.length);
+        combined.set(buffered);
+        combined.set(chunk.value, buffered.length);
+        buffered = combined;
+      }
+      const result = buffered.slice(0, length);
+      buffered = buffered.slice(length);
+      return result;
+    },
+    async readChunk() {
+      if (buffered.length > 0) {
+        const value = buffered;
+        buffered = new Uint8Array(0);
+        return { value, done: false };
+      }
+      return reader.read();
+    },
+    cancel() {
+      return reader.cancel();
+    }
+  };
+}
+
+function findHeaderEnd(bytes) {
+  for (let index = 0; index <= bytes.length - 4; index++) {
+    if (bytes[index] === 13 && bytes[index + 1] === 10 && bytes[index + 2] === 13 && bytes[index + 3] === 10) return index;
+  }
+  return -1;
 }
 
 // 管理端：强制触发后台处理（用于排查和即时处理）
@@ -525,8 +658,6 @@ const RETRY_DELAY_MS = 5 * 60 * 1000; // 失败项 5 分钟后可再次处理
 // 批量 IP 归属地接口（ip-api.com 免费批量，POST，每次最多 100 个 IP）
 const BATCH_API_URL = 'http://ip-api.com/batch';
 const BATCH_MAX_IPS = 100; // 单次批量请求最多 IP 数
-const BATCH_LIMIT_PER_MIN = 15; // 免费版每分钟最多批量请求次数（每轮最多 1500 个 IP）
-
 // 定时触发：区分「重新拉取上游」与「增量处理 IP」
 const AGGREGATE_CRON = '0 */3 * * *'; // 每 3 小时拉取一次上游订阅
 const PROCESS_CRON = '* * * * *'; // 每分钟处理一批 IP
@@ -1005,11 +1136,12 @@ async function handleAdmin(env) {
         <li>访问 <code>/fetch</code> 时，程序会优先返回缓存内容，响应速度极快</li>
         <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
         <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
-        <li><strong>新增：</strong>自动识别每行中的 IP 地址，并在末尾追加 <code>#国家简拼国家名</code> 的地区信息</li>
+        <li><strong>节点测速：</strong>上游内容变化后会重新测速所有 IP 节点；目前支持 VLESS TCP/TLS（不支持 Reality、WS、gRPC 或独立 SNI），结果格式为 <code>#地区|Mbpsmb/s</code></li>
+        <li>示例输出：<code>1.2.3.4:443#JP日本|12.34mb/s</code>；不支持的协议会显示 <code>|测速失败</code></li>
         <li><span class="badge badge-new">NEW</span> <strong>后台异步处理：</strong>时间触发器触发后，先快速返回带 <code>#未处理</code> 标记的结果，之后在后台逐个分析 IP 归属地，成功替换为实际地区，失败标记 <code>#分析失败</code></li>
         <li><span class="badge badge-new">NEW</span> <strong>实时进度：</strong>后台处理期间，外部请求直接返回当前处理进度（已处理 / 未处理 / 分析失败）</li>
         <li><span class="badge badge-new">NEW</span> <strong>重试失败：</strong>如果某些 IP 分析失败，可点击「重试分析失败」按钮，将这些 IP 重新标记为 <code>#未处理</code> 并再次进入分析流程</li>
-        <li>示例输出：<code>192.168.1.1:8080#CN中国</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#分析失败</code></li>
+        <li>示例输出：<code>1.2.3.4:443#JP日本|12.34mb/s</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#分析失败</code></li>
       </ul>
     </div>
   </div>
@@ -1129,6 +1261,7 @@ async function handleAdmin(env) {
 
       btn.disabled = false;
     }
+
   </script>
 </body>
 </html>`;
