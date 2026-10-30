@@ -248,9 +248,12 @@ async function processIpQueue(env) {
   try {
     // 先读一次缓存：没有待处理项就直接返回，避免无谓的加锁与 KV 写入
     const preview = await env.LINKS_KV.get('cached_aggregate');
-    if (!preview || !/#未处理|#分析失败-待重试/.test(preview)) {
+    if (!preview) {
       return;
     }
+    const hasPending = /#未处理|#分析失败-待重试/.test(preview);
+    const previewSorted = sortLinesByLatency(preview.split('\n')).join('\n');
+    if (!hasPending && previewSorted === preview) return;
 
     // 抢锁：防止 cron / 手动 / retry 等多个入口并发处理、互相覆盖
     if (!(await tryAcquireLock(env))) {
@@ -311,9 +314,11 @@ async function processIpQueue(env) {
       }
 
       if (pendingItems.length === 0) {
-        // 本轮无待处理项，仅在清理了无效标记时才写回
-        if (changed) {
-          await writeCachedAggregate(env, lines.join('\n'));
+        // 即使没有待处理项，也整理已经完成的延迟结果。
+        const sortedLines = sortLinesByLatency(lines);
+        const output = sortedLines.join('\n');
+        if (changed || output !== current) {
+          await writeCachedAggregate(env, output);
         }
         return;
       }
@@ -384,7 +389,7 @@ async function processIpQueue(env) {
 
       // 本轮只写回一次 KV（过滤掉已删除的行）
       const filteredLines = lines.filter(line => line !== null);
-      await writeCachedAggregate(env, filteredLines.join('\n'));
+      await writeCachedAggregate(env, sortLinesByLatency(filteredLines).join('\n'));
 
       console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
     } finally {
@@ -393,6 +398,24 @@ async function processIpQueue(env) {
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
   }
+}
+
+function sortLinesByLatency(lines) {
+  return lines
+    .map((line, index) => ({
+      line,
+      index,
+      latency: Number((line.match(/\|(\d+(?:\.\d+)?)ms$/) || [])[1])
+    }))
+    .sort((left, right) => {
+      const leftMeasured = Number.isFinite(left.latency);
+      const rightMeasured = Number.isFinite(right.latency);
+      if (leftMeasured && rightMeasured) return left.latency - right.latency || left.index - right.index;
+      if (leftMeasured) return -1;
+      if (rightMeasured) return 1;
+      return left.index - right.index;
+    })
+    .map(item => item.line);
 }
 
 // 睡眠辅助函数
