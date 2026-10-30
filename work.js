@@ -282,7 +282,6 @@ async function processIpQueue(env) {
     let failedCount = 0;
     let deletedCount = 0;
     let skippedCount = 0;
-    let deferredCount = 0;
     let speedFailedCount = 0;
 
     try {
@@ -347,41 +346,17 @@ async function processIpQueue(env) {
 
       const { resolved, unresolved, status: batchStatus } = await resolveIpLocations(uniqueIps);
       if (batchStatus !== 'ok') {
-        console.warn(`[IP API] batch lookup status: ${batchStatus}; checking unresolved IPs with fallback APIs.`);
+        console.warn(`[IP API] batch lookup status: ${batchStatus}; unresolved IPs will be retried later.`);
       }
       if (unresolved.size > 0) {
-        console.log(`[IP API] ${unresolved.size} IP(s) need fallback comparison.`);
-      }
-
-      const fallbackIps = [...unresolved.keys()];
-      const batchSubrequestCount = Math.ceil(uniqueIps.length / BATCH_MAX_IPS) * BATCH_SUBREQUESTS_PER_CHUNK;
-      const fallbackBudget = Math.max(0, Math.floor(
-        (SUBREQUEST_BUDGET - batchSubrequestCount) / FALLBACK_SUBREQUESTS_PER_IP
-      ));
-      const fallbackTargets = fallbackIps.slice(0, fallbackBudget);
-      const attemptedFallbackIps = new Set(fallbackTargets);
-      const fallbackResults = await mapWithConcurrency(fallbackTargets, FALLBACK_CONCURRENCY, async ip => {
-        const batchInfo = unresolved.get(ip);
-        const lookup = await getIpLocationCandidates(ip, batchInfo.candidates);
-        const reason = lookup.result ? null : [...new Set([batchInfo.reason, ...lookup.issues])]
-          .slice(0, 3)
-          .join('；') || '多源结果仍未达成一致';
-        return { ip, result: lookup.result, reason };
-      });
-      const failureReasons = new Map();
-      for (const { ip, result, reason } of fallbackResults) {
-        if (result) resolved.set(ip, result);
-        else failureReasons.set(ip, reason || '多源结果仍未达成一致');
+        console.log(`[IP API] ${unresolved.size} IP(s) were not confirmed by batch consensus.`);
       }
 
       const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
         const clean = getCleanIp(item.ip);
         const result = resolved.get(clean);
         if (result === undefined) {
-          if (unresolved.has(clean) && !attemptedFallbackIps.has(clean)) {
-            return { line: `${item.line}#未处理`, deferred: true };
-          }
-          const reason = failureReasons.get(clean) || unresolved.get(clean)?.reason || '未能取得有效归属结果';
+          const reason = unresolved.get(clean)?.reason || '批量接口未返回有效归属';
           return { line: `${item.line}#分析失败-待重试（${reason}）@${Date.now()}`, failed: true };
         }
         if (result === CLOUDFLARE_MARK) {
@@ -400,7 +375,6 @@ async function processIpQueue(env) {
         lines[pendingItems[i].index] = itemResults[i].line;
         if (itemResults[i].failed) failedCount++;
         else if (itemResults[i].deleted) deletedCount++;
-        else if (itemResults[i].deferred) deferredCount++;
         else {
           processedCount++;
           if (itemResults[i].speedFailed) speedFailedCount++;
@@ -411,7 +385,7 @@ async function processIpQueue(env) {
       const filteredLines = lines.filter(line => line !== null);
       await writeCachedAggregate(env, sortLinesByLatency(filteredLines).join('\n'));
 
-      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Deferred: ${deferredCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
+      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
     } finally {
       await releaseLock(env);
     }
@@ -598,26 +572,12 @@ async function handleFetch(env, corsHeaders, ctx) {
 
 // ==================== IP 查询相关（保持原有逻辑） ====================
 
-// API 退避（当某个 API 返回 429 时，记录退避到期时间）
-const apiBackoff = new Map();
-const API_BACKOFF_MS = 60 * 1000; // 1 分钟退避
-
-// 主 API 速率限制（轻量、本实例内）：每分钟可保留调用数
-const apiUsage = new Map();
-const API_WINDOW_MS = 60 * 1000;
-const API_PRIMARY_LIMIT = 30; // 主接口本地限速（保守）；额度用完后自动切备用接口
-
 const BATCH_MAX_IPS = 100;
-// 每轮批量归属查询上限；补查和测速分别由各自的限流控制。
+// 每轮批量归属查询上限；测速使用独立并发限制。
 const MAX_PER_RUN = BATCH_MAX_IPS;
-const FALLBACK_CONCURRENCY = 3;
 const SPEED_TEST_CONCURRENCY = 6;
 // 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
 const SUBREQUEST_BUDGET = 44;
-// 每个批次的批量查询固定消耗：ip-api + countries.dev 各 1 次
-const BATCH_SUBREQUESTS_PER_CHUNK = 2;
-// 单个 IP 降级查询最多消耗：uapis.cn + ipwho.is 各 1 次
-const FALLBACK_SUBREQUESTS_PER_IP = 2;
 // 上游拉取并发（与 6 个并发连接上限对齐）
 const AGGREGATE_CONCURRENCY = 6;
 // 上游聚合与 IP 队列分属不同 invocation，各自使用独立子请求预算。
@@ -629,6 +589,7 @@ const RETRY_DELAY_MS = 5 * 60 * 1000; // 失败项 5 分钟后可再次处理
 // 批量 IP 归属地接口（ip-api.com 免费批量，POST，每次最多 100 个 IP）
 const BATCH_API_URL = 'http://ip-api.com/batch';
 const BATCH_API_URL_SECONDARY = 'https://countries.dev/ip?fields=name';
+const BATCH_API_URL_GEOJS = 'https://get.geojs.io/v1/ip/country.json?ip=';
 // 定时触发：区分「重新拉取上游」与「增量处理 IP」
 const AGGREGATE_CRON = '0 */3 * * *'; // 每 3 小时拉取一次上游订阅
 const PROCESS_CRON = '* * * * *'; // 每分钟处理一批 IP
@@ -747,7 +708,33 @@ async function getIpLocationBatchSecondary(cleanIps) {
   }
 }
 
-// 并行查询两个批量接口；只有国家代码一致时直接采纳，否则保留候选交给限速接口仲裁。
+async function getIpLocationBatchGeoJs(cleanIps) {
+  try {
+    const url = `${BATCH_API_URL_GEOJS}${encodeURIComponent(cleanIps.join(','))}`;
+    const resp = await fetchWithTimeout(url, {}, 5000);
+    if (!resp.ok) {
+      return { results: new Map(), status: resp.status === 429 ? 'rate_limited' : 'error' };
+    }
+
+    const data = await resp.json();
+    const results = new Map();
+    const items = Array.isArray(data) ? data : [data];
+    const requestedIps = new Set(cleanIps);
+    for (const item of items) {
+      const ip = item && getCleanIp(String(item.ip || ''));
+      const code = String(item && item.country || '').toUpperCase();
+      if (!ip || !requestedIps.has(ip) || !/^[A-Z]{2}$/.test(code)) continue;
+      const name = countryCodeMap[code] || item.name || '未知';
+      results.set(ip, `${code}${name}`);
+    }
+    return { results, status: 'ok' };
+  } catch (e) {
+    console.error('[IP API] GeoJS batch query failed:', e.message);
+    return { results: new Map(), status: 'error' };
+  }
+}
+
+// 三个免费批量接口按国家代码投票；至少两家一致才采纳。
 async function resolveIpLocations(uniqueIps) {
   const resolved = new Map();
   const unresolved = new Map();
@@ -755,9 +742,10 @@ async function resolveIpLocations(uniqueIps) {
 
   for (let i = 0; i < uniqueIps.length; i += BATCH_MAX_IPS) {
     const batch = uniqueIps.slice(i, i + BATCH_MAX_IPS);
-    const [primary, secondary] = await Promise.all([
+    const [primary, secondary, geojs] = await Promise.all([
       getIpLocationBatch(batch),
-      getIpLocationBatchSecondary(batch)
+      getIpLocationBatchSecondary(batch),
+      getIpLocationBatchGeoJs(batch)
     ]);
 
     for (const ip of batch) {
@@ -768,27 +756,45 @@ async function resolveIpLocations(uniqueIps) {
 
       const primaryResult = primary.results.get(ip);
       const secondaryResult = secondary.results.get(ip);
-      const candidates = [primaryResult, secondaryResult]
-        .filter(result => result && getCountryResultKey(result));
-      const primaryKey = getCountryResultKey(primaryResult);
-      const secondaryKey = getCountryResultKey(secondaryResult);
-      if (primaryKey && primaryKey === secondaryKey) {
-        resolved.set(ip, primaryResult);
+      const geojsResult = geojs.results.get(ip);
+      const sources = [
+        { name: 'ip-api', result: primaryResult, status: primary.status },
+        { name: 'countries.dev', result: secondaryResult, status: secondary.status },
+        { name: 'GeoJS', result: geojsResult, status: geojs.status }
+      ];
+      const votes = new Map();
+      for (const source of sources) {
+        const code = getCountryResultKey(source.result);
+        if (!code) continue;
+        const vote = votes.get(code) || { count: 0, result: source.result };
+        vote.count++;
+        votes.set(code, vote);
+      }
+      const rankedVotes = [...votes.values()].sort((left, right) => right.count - left.count);
+      if (rankedVotes.length && rankedVotes[0].count >= 2 &&
+          rankedVotes[0].count > (rankedVotes[1]?.count || 0)) {
+        resolved.set(ip, rankedVotes[0].result);
       } else {
         const reasons = [];
-        if (primaryKey && secondaryKey && primaryKey !== secondaryKey) {
-          reasons.push('批量接口国家不一致');
+        const returned = sources
+          .map(source => `${source.name}:${getCountryResultKey(source.result) || '-'}`)
+          .filter(source => !source.endsWith(':-'));
+        if (returned.length > 1) {
+          reasons.push(`批量结果无多数(${returned.join(',')})`);
         }
-        if (!primaryKey) reasons.push(getLookupFailureReason('ip-api', primary.status));
-        if (!secondaryKey) reasons.push(getLookupFailureReason('countries.dev', secondary.status));
-        unresolved.set(ip, { candidates, reason: reasons.join('、') || '批量接口未达成一致' });
+        for (const source of sources) {
+          if (!getCountryResultKey(source.result)) {
+            reasons.push(getLookupFailureReason(source.name, source.status));
+          }
+        }
+        unresolved.set(ip, { reason: reasons.join('、') || '批量接口未达成多数' });
       }
     }
 
-    if (primary.results.size === 0 && secondary.results.size === 0 &&
+    if (primary.results.size === 0 && secondary.results.size === 0 && geojs.results.size === 0 &&
         primary.blocked.size === 0 &&
-        primary.status !== 'ok' && secondary.status !== 'ok') {
-      status = primary.status === 'rate_limited' || secondary.status === 'rate_limited'
+        primary.status !== 'ok' && secondary.status !== 'ok' && geojs.status !== 'ok') {
+      status = [primary.status, secondary.status, geojs.status].includes('rate_limited')
         ? 'rate_limited'
         : 'error';
       break;
@@ -796,54 +802,6 @@ async function resolveIpLocations(uniqueIps) {
   }
 
   return { resolved, unresolved, status };
-}
-
-// 查询所有当前可用的限速接口，结果由调用方与批量接口候选交叉仲裁。
-async function getIpLocationCandidates(ip, existingCandidates = []) {
-  const cleanIp = getCleanIp(ip);
-  if (!cleanIp) return { result: null, candidates: [], issues: ['IP 地址无效'] };
-
-  const apis = [
-    {
-      name: 'uapis.cn',
-      url: `https://uapis.cn/api/v1/network/ipinfo?ip=${cleanIp}`,
-      extract: data => (data && data.region ? data.region.trim() : null),
-      timeout: 3000
-    },
-    {
-      name: 'ipwho.is',
-      url: `https://ipwho.is/${cleanIp}?output=json`,
-      extract: data => (data ? (data.country_code || data.country || data.country_code2 || null) : null),
-      timeout: 3000
-    }
-  ];
-
-  const candidates = [];
-  const issues = [];
-  for (const api of apis) {
-    if (isApiBackedOff(api.name)) {
-      issues.push(`${api.name}处于限流退避`);
-      continue;
-    }
-    if (api.name === 'uapis.cn' && !consumePrimaryQuota(api.name)) {
-      issues.push('uapis.cn本地额度已用完');
-      continue;
-    }
-    const outcome = await queryApi(cleanIp, api);
-    const result = outcome.result && getCountryResultKey(outcome.result) ? outcome.result : null;
-    if (result) {
-      candidates.push(result);
-      const consensus = selectCountryConsensus([...existingCandidates, ...candidates]);
-      if (consensus) return { result: consensus, candidates, issues };
-    } else {
-      issues.push(`${api.name}${outcome.reason || '未识别国家'}`);
-    }
-  }
-  return {
-    result: selectCountryConsensus([...existingCandidates, ...candidates]),
-    candidates,
-    issues
-  };
 }
 
 function getLookupFailureReason(apiName, status) {
@@ -857,106 +815,6 @@ function getCountryResultKey(result) {
   if (!match) return null;
   const code = match[1].toUpperCase();
   return code === 'UN' ? null : code;
-}
-
-function selectCountryConsensus(results) {
-  const votes = new Map();
-  for (const result of results) {
-    const code = getCountryResultKey(result);
-    if (!code) continue;
-    const vote = votes.get(code) || { count: 0, result };
-    vote.count++;
-    votes.set(code, vote);
-  }
-
-  const ranked = [...votes.values()].sort((left, right) => right.count - left.count);
-  if (!ranked.length || ranked[0].count < 2 || ranked[0].count === ranked[1]?.count) return null;
-  return ranked[0].result;
-}
-
-// 检查并消耗主接口本地额度（滚动 1 分钟窗口）
-function consumePrimaryQuota(apiName) {
-  const now = Date.now();
-  const usage = apiUsage.get(apiName) || { windowStart: now, count: 0 };
-  if (now - usage.windowStart > API_WINDOW_MS) {
-    usage.windowStart = now;
-    usage.count = 0;
-  }
-  if (usage.count >= API_PRIMARY_LIMIT) {
-    return false; // 本轮额度用完，切备用
-  }
-  usage.count++;
-  apiUsage.set(apiName, usage);
-  return true;
-}
-
-// 调用单个 IP 接口，返回 { result, rateLimited }
-async function queryApi(cleanIp, api) {
-  try {
-    const resp = await fetchWithTimeout(api.url, { cf: { cacheTtl: 86400 } }, api.timeout);
-    if (!resp.ok) {
-      if (resp.status === 429) {
-        apiBackoff.set(api.name, Date.now() + API_BACKOFF_MS);
-        console.log(`[IP API] ${api.name} rate-limited (HTTP 429)`);
-        return { result: null, rateLimited: true, reason: '限流(429)' };
-      }
-      return { result: null, rateLimited: false, reason: `HTTP ${resp.status}` };
-    }
-
-    const data = await resp.json().catch(() => null);
-    const extracted = api.extract(data);
-    if (extracted) {
-      return { result: toCountryResult(api.name, extracted), rateLimited: false };
-    }
-    return { result: null, rateLimited: false, reason: '未返回归属数据' };
-  } catch (e) {
-    const msg = (e && e.message) ? e.message : '';
-    if (/429|Too Many Requests/i.test(msg)) {
-      apiBackoff.set(api.name, Date.now() + API_BACKOFF_MS);
-      console.log(`[IP API] ${api.name} rate-limited (${msg})`);
-      return { result: null, rateLimited: true, reason: '限流(429)' };
-    }
-    console.error(`[IP API] ${api.name} error:`, msg);
-    return { result: null, rateLimited: false, reason: /timeout/i.test(msg) ? '请求超时' : '网络错误' };
-  }
-}
-
-function isApiBackedOff(apiName) {
-  const until = apiBackoff.get(apiName) || 0;
-  return until > Date.now();
-}
-
-// 将接口返回的原始地区信息转换为 `国家代码 + 中文国家名` 格式
-function toCountryResult(apiName, extracted) {
-  if (apiName === 'uapis.cn') {
-    const region = String(extracted || '').trim();
-    let code = 'UN';
-    for (const [k, v] of Object.entries(countryCodeMap)) {
-      if (region.includes(v)) { code = k; break; }
-    }
-    if (code === 'UN') {
-      if (/^(美国|USA?|United States)/.test(region)) code = 'US';
-      else if (/^(日本|Japan|JP)/.test(region)) code = 'JP';
-      else if (/^(韩国|Korea|KR)/.test(region)) code = 'KR';
-      else if (/^(新加坡|Singapore|SG)/.test(region)) code = 'SG';
-      else if (/^(香港|Hong Kong|HK)/.test(region)) code = 'HK';
-      else if (/^(台湾|Taiwan|TW)/.test(region)) code = 'TW';
-      else if (/^(英国|United Kingdom|GB|UK)/.test(region)) code = 'GB';
-      else if (/^(德国|Germany|DE)/.test(region)) code = 'DE';
-      else if (/^(法国|France|FR)/.test(region)) code = 'FR';
-      else if (/^(俄罗斯|Russia|RU)/.test(region)) code = 'RU';
-      else if (/^(加拿大|Canada|CA)/.test(region)) code = 'CA';
-      else if (/^(澳大利亚|Australia|AU)/.test(region)) code = 'AU';
-      else if (/^(中国|China|CN)/.test(region)) code = 'CN';
-    }
-    const countryName = countryCodeMap[code] || region.split(/\s+/)[0];
-    return `${code}${countryName}`;
-  }
-
-  const extractedStr = String(extracted || '').trim();
-  const code = extractedStr.length === 2 ? extractedStr.toUpperCase() : '';
-  const countryName = countryCodeMap[code] || (extractedStr || '未知');
-  return `${code}${countryName}`;
 }
 
 // 清理 IP（去掉端口等），兼容 IPv4 和 IPv6
