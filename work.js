@@ -353,7 +353,7 @@ async function processIpQueue(env) {
       }
       const uniqueIps = [...byIp.keys()];
 
-      const { resolved, status: batchStatus } = await resolveIpLocations(uniqueIps);
+      const { resolved, conflicts, status: batchStatus } = await resolveIpLocations(uniqueIps);
 
       if (batchStatus === 'rate_limited') {
         // 批量接口限流：本轮全部标记待重试，等下一分钟再处理
@@ -362,8 +362,11 @@ async function processIpQueue(env) {
           failedCount++;
         }
       } else {
+        if (conflicts.size > 0) {
+          console.warn(`[IP API] country mismatch for ${conflicts.size} IP(s); retrying later.`);
+        }
         // 批量未覆盖的 IP 用单个接口降级，预算按子请求核算
-        const missing = uniqueIps.filter(ip => !resolved.has(ip));
+        const missing = uniqueIps.filter(ip => !resolved.has(ip) && !conflicts.has(ip));
         const fallbackBudget = Math.max(0, Math.floor(
           (SUBREQUEST_BUDGET - BATCH_SUBREQUESTS_PER_RUN - pendingItems.length) / FALLBACK_SUBREQUESTS_PER_IP
         ));
@@ -712,7 +715,7 @@ async function getIpLocationBatch(cleanIps) {
   }
 }
 
-// 第二个批量接口（countries.dev，免 key，最多 100 个 IP；结果覆盖 ip-api 的同名 IP）
+// 第二个批量接口（countries.dev，免 key，最多 100 个 IP）
 async function getIpLocationBatchSecondary(cleanIps) {
   try {
     const resp = await fetchWithTimeout(BATCH_API_URL_SECONDARY, {
@@ -751,6 +754,7 @@ async function getIpLocationBatchSecondary(cleanIps) {
 // 并行查询两个批量接口并合并结果（countries.dev 优先；Cloudflare 标记优先于两者）
 async function resolveIpLocations(uniqueIps) {
   const resolved = new Map();
+  const conflicts = new Set();
   let status = 'ok';
 
   for (let i = 0; i < uniqueIps.length; i += BATCH_MAX_IPS) {
@@ -760,9 +764,21 @@ async function resolveIpLocations(uniqueIps) {
       getIpLocationBatchSecondary(batch)
     ]);
 
-    for (const [k, v] of primary.results) resolved.set(k, v);
-    for (const [k, v] of secondary.results) resolved.set(k, v);
-    for (const ip of primary.blocked) resolved.set(ip, CLOUDFLARE_MARK);
+    for (const ip of batch) {
+      if (primary.blocked.has(ip)) {
+        resolved.set(ip, CLOUDFLARE_MARK);
+        continue;
+      }
+
+      const primaryResult = primary.results.get(ip);
+      const secondaryResult = secondary.results.get(ip);
+      if (primaryResult && secondaryResult) {
+        if (primaryResult === secondaryResult) resolved.set(ip, primaryResult);
+        else conflicts.add(ip);
+      } else if (primaryResult || secondaryResult) {
+        resolved.set(ip, primaryResult || secondaryResult);
+      }
+    }
 
     if (primary.results.size === 0 && secondary.results.size === 0 &&
         primary.blocked.size === 0 &&
@@ -774,7 +790,7 @@ async function resolveIpLocations(uniqueIps) {
     }
   }
 
-  return { resolved, status };
+  return { resolved, conflicts, status };
 }
 
 // 查询 IP 的地区（本地限速 + 退避；主接口额度用完/限流时自动切备用，备用也限流才停止）
