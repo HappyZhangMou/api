@@ -362,12 +362,11 @@ async function processIpQueue(env) {
       const attemptedFallbackIps = new Set(fallbackTargets);
       const fallbackResults = await mapWithConcurrency(fallbackTargets, FALLBACK_CONCURRENCY, async ip => {
         const batchInfo = unresolved.get(ip);
-        const lookup = await getIpLocationCandidates(ip);
-        const result = selectCountryConsensus([...batchInfo.candidates, ...lookup.candidates]);
-        const reason = result ? null : [...new Set([batchInfo.reason, ...lookup.issues])]
+        const lookup = await getIpLocationCandidates(ip, batchInfo.candidates);
+        const reason = lookup.result ? null : [...new Set([batchInfo.reason, ...lookup.issues])]
           .slice(0, 3)
           .join('；') || '多源结果仍未达成一致';
-        return { ip, result, reason };
+        return { ip, result: lookup.result, reason };
       });
       const failureReasons = new Map();
       for (const { ip, result, reason } of fallbackResults) {
@@ -800,9 +799,9 @@ async function resolveIpLocations(uniqueIps) {
 }
 
 // 查询所有当前可用的限速接口，结果由调用方与批量接口候选交叉仲裁。
-async function getIpLocationCandidates(ip) {
+async function getIpLocationCandidates(ip, existingCandidates = []) {
   const cleanIp = getCleanIp(ip);
-  if (!cleanIp) return [];
+  if (!cleanIp) return { result: null, candidates: [], issues: ['IP 地址无效'] };
 
   const apis = [
     {
@@ -819,21 +818,31 @@ async function getIpLocationCandidates(ip) {
     }
   ];
 
-  const results = await Promise.all(apis.map(async api => {
-    if (isApiBackedOff(api.name)) return { result: null, issue: `${api.name}处于限流退避` };
+  const candidates = [];
+  const issues = [];
+  for (const api of apis) {
+    if (isApiBackedOff(api.name)) {
+      issues.push(`${api.name}处于限流退避`);
+      continue;
+    }
     if (api.name === 'uapis.cn' && !consumePrimaryQuota(api.name)) {
-      return { result: null, issue: 'uapis.cn本地额度已用完' };
+      issues.push('uapis.cn本地额度已用完');
+      continue;
     }
     const outcome = await queryApi(cleanIp, api);
     const result = outcome.result && getCountryResultKey(outcome.result) ? outcome.result : null;
-    return {
-      result,
-      issue: result ? null : `${api.name}${outcome.reason || '未识别国家'}`
-    };
-  }));
+    if (result) {
+      candidates.push(result);
+      const consensus = selectCountryConsensus([...existingCandidates, ...candidates]);
+      if (consensus) return { result: consensus, candidates, issues };
+    } else {
+      issues.push(`${api.name}${outcome.reason || '未识别国家'}`);
+    }
+  }
   return {
-    candidates: results.map(item => item.result).filter(result => result && getCountryResultKey(result)),
-    issues: results.map(item => item.issue).filter(Boolean)
+    result: selectCountryConsensus([...existingCandidates, ...candidates]),
+    candidates,
+    issues
   };
 }
 
