@@ -208,10 +208,10 @@ async function aggregateLinks(env) {
   const [oldCached, oldHash] = await Promise.all([
     env.LINKS_KV.get('cached_aggregate'),
     env.LINKS_KV.get('upstream_hash')
-  ]);
+  const result = outcome.result && getCountryResultKey(outcome.result) ? outcome.result : null;
   if (oldCached && oldHash === upstreamHash) return oldCached;
-
-  // 上游内容有变化时，所有节点重新入队，包括已存在测速结果的 IP。
+    result,
+    issue: result ? null : `${api.name}${outcome.reason || '未识别国家'}`
   const markedLines = allLines.map(line => extractIp(line) ? `${line}#未处理` : line);
 
   // 3. 组装初始输出并立即写入缓存
@@ -302,9 +302,9 @@ async function processIpQueue(env) {
         if (line.endsWith('#未处理')) {
           contentWithoutMark = line.slice(0, -4);
         } else {
-          const retryMatch = line.match(/^(.*)#分析失败-待重试(?:@(\d+))?$/);
+          const retryMatch = line.match(/^(.*)#分析失败-待重试(?:（([^）]*)）)?(?:@(\d+))?$/);
           if (retryMatch) {
-            const ts = retryMatch[2] ? parseInt(retryMatch[2], 10) : 0;
+            const ts = retryMatch[3] ? parseInt(retryMatch[3], 10) : 0;
             if (!ts || ts <= Date.now() - RETRY_DELAY_MS) {
               contentWithoutMark = retryMatch[1];
             } else {
@@ -362,12 +362,18 @@ async function processIpQueue(env) {
       const fallbackTargets = fallbackIps.slice(0, fallbackBudget);
       const attemptedFallbackIps = new Set(fallbackTargets);
       const fallbackResults = await mapWithConcurrency(fallbackTargets, FALLBACK_CONCURRENCY, async ip => {
-        const candidates = await getIpLocationCandidates(ip);
-        const result = selectCountryConsensus([...(unresolved.get(ip) || []), ...candidates]);
-        return { ip, result };
+        const batchInfo = unresolved.get(ip);
+        const lookup = await getIpLocationCandidates(ip);
+        const result = selectCountryConsensus([...batchInfo.candidates, ...lookup.candidates]);
+        const reason = result ? null : [...new Set([batchInfo.reason, ...lookup.issues])]
+          .slice(0, 3)
+          .join('；') || '多源结果仍未达成一致';
+        return { ip, result, reason };
       });
-      for (const { ip, result } of fallbackResults) {
+      const failureReasons = new Map();
+      for (const { ip, result, reason } of fallbackResults) {
         if (result) resolved.set(ip, result);
+        else failureReasons.set(ip, reason || '多源结果仍未达成一致');
       }
 
       const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
@@ -377,7 +383,8 @@ async function processIpQueue(env) {
           if (unresolved.has(clean) && !attemptedFallbackIps.has(clean)) {
             return { line: `${item.line}#未处理`, deferred: true };
           }
-          return { line: `${item.line}#分析失败-待重试@${Date.now()}`, failed: true };
+          const reason = failureReasons.get(clean) || unresolved.get(clean)?.reason || '未能取得有效归属结果';
+          return { line: `${item.line}#分析失败-待重试（${reason}）@${Date.now()}`, failed: true };
         }
         if (result === CLOUDFLARE_MARK) {
           return { line: `${item.line}#Cloudflare`, cloudflare: true };
@@ -453,7 +460,7 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
 
     const updatedLines = lines.map(line => {
       // 支持多种失败标记：#分析失败、#分析失败-待重试 或 带时间戳的 #分析失败-待重试@<ts>
-      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:@\d+)?)?|#[^#]*\|连接失败)$/);
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#[^#]*\|连接失败)$/);
       if (match) {
         retryCount++;
         return match[1] + '#未处理';
@@ -642,7 +649,7 @@ const countryCodeMap = {
   'SK': '斯洛伐克', 'LT': '立陶宛', 'LV': '拉脱维亚', 'EE': '爱沙尼亚', 'HR': '克罗地亚',
   'SI': '斯洛文尼亚', 'GR': '希腊', 'IS': '冰岛', 'LU': '卢森堡', 'MT': '马耳他',
   'CY': '塞浦路斯', 'LI': '列支敦士登', 'MC': '摩纳哥', 'AD': '安道尔', 'SM': '圣马力诺',
-  'VA': '梵蒂冈', 'MD': '摩尔多瓦', 'BY': '白俄罗斯', 'GE': '格鲁吉亚', 'AM': '亚美尼亚',
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#[^#]*\|连接失败)$/);
   'AZ': '阿塞拜疆', 'KZ': '哈萨克斯坦', 'UZ': '乌兹别克', 'KG': '吉尔吉斯', 'TJ': '塔吉克',
   'TM': '土库曼', 'MN': '蒙古', 'KP': '朝鲜', 'BD': '孟加拉', 'LK': '斯里兰卡',
   'NP': '尼泊尔', 'BT': '不丹', 'MV': '马尔代夫', 'PK': '巴基斯坦', 'AF': '阿富汗',
@@ -676,7 +683,7 @@ async function getIpLocationBatch(cleanIps) {
 
     if (!resp.ok) {
       if (resp.status === 429) {
-        console.log('[IP API] batch rate-limited (HTTP 429)');
+    contentWithoutMark = retryMatch[1];
         return { results: new Map(), blocked: new Set(), status: 'rate_limited' };
       }
       return { results: new Map(), blocked: new Set(), status: 'error' };
@@ -771,7 +778,13 @@ async function resolveIpLocations(uniqueIps) {
       if (primaryKey && primaryKey === secondaryKey) {
         resolved.set(ip, primaryResult);
       } else {
-        unresolved.set(ip, candidates);
+        const reasons = [];
+        if (primaryKey && secondaryKey && primaryKey !== secondaryKey) {
+          reasons.push('批量接口国家不一致');
+        }
+        if (!primaryKey) reasons.push(getLookupFailureReason('ip-api', primary.status));
+        if (!secondaryKey) reasons.push(getLookupFailureReason('countries.dev', secondary.status));
+        unresolved.set(ip, { candidates, reason: reasons.join('、') || '批量接口未达成一致' });
       }
     }
 
@@ -809,12 +822,27 @@ async function getIpLocationCandidates(ip) {
   ];
 
   const results = await Promise.all(apis.map(async api => {
-    if (isApiBackedOff(api.name)) return null;
-    if (api.name === 'uapis.cn' && !consumePrimaryQuota(api.name)) return null;
+    if (isApiBackedOff(api.name)) return { result: null, issue: `${api.name}处于限流退避` };
+    if (api.name === 'uapis.cn' && !consumePrimaryQuota(api.name)) {
+      return { result: null, issue: 'uapis.cn本地额度已用完' };
+    }
     const outcome = await queryApi(cleanIp, api);
-    return outcome.result;
+    const result = outcome.result && getCountryResultKey(outcome.result) ? outcome.result : null;
+    return {
+      result,
+      issue: result ? null : `${api.name}${outcome.reason || '未识别国家'}`
+    };
   }));
-  return results.filter(result => result && getCountryResultKey(result));
+  return {
+    candidates: results.map(item => item.result).filter(result => result && getCountryResultKey(result)),
+    issues: results.map(item => item.issue).filter(Boolean)
+  };
+}
+
+function getLookupFailureReason(apiName, status) {
+  if (status === 'rate_limited') return `${apiName}限流(429)`;
+  if (status === 'error') return `${apiName}请求失败`;
+  return `${apiName}未返回归属`;
 }
 
 function getCountryResultKey(result) {
@@ -863,9 +891,9 @@ async function queryApi(cleanIp, api) {
       if (resp.status === 429) {
         apiBackoff.set(api.name, Date.now() + API_BACKOFF_MS);
         console.log(`[IP API] ${api.name} rate-limited (HTTP 429)`);
-        return { result: null, rateLimited: true };
+        return { result: null, rateLimited: true, reason: '限流(429)' };
       }
-      return { result: null, rateLimited: false };
+      return { result: null, rateLimited: false, reason: `HTTP ${resp.status}` };
     }
 
     const data = await resp.json().catch(() => null);
@@ -873,16 +901,16 @@ async function queryApi(cleanIp, api) {
     if (extracted) {
       return { result: toCountryResult(api.name, extracted), rateLimited: false };
     }
-    return { result: null, rateLimited: false };
+    return { result: null, rateLimited: false, reason: '未返回归属数据' };
   } catch (e) {
     const msg = (e && e.message) ? e.message : '';
     if (/429|Too Many Requests/i.test(msg)) {
       apiBackoff.set(api.name, Date.now() + API_BACKOFF_MS);
       console.log(`[IP API] ${api.name} rate-limited (${msg})`);
-      return { result: null, rateLimited: true };
+      return { result: null, rateLimited: true, reason: '限流(429)' };
     }
     console.error(`[IP API] ${api.name} error:`, msg);
-    return { result: null, rateLimited: false };
+    return { result: null, rateLimited: false, reason: /timeout/i.test(msg) ? '请求超时' : '网络错误' };
   }
 }
 
@@ -1004,7 +1032,7 @@ async function handleAdmin(env) {
       if (!trimmed || trimmed.startsWith('#')) continue;
       totalLines++;
       if (trimmed.endsWith('#未处理')) unprocessed++;
-      else if (/#分析失败(?:-待重试(?:@\d+)?)?$/.test(trimmed)) {
+      else if (/#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?$/.test(trimmed)) {
         if (trimmed.endsWith('#分析失败')) failed++;
         else failedRetry++;
       } else if (trimmed.endsWith('|连接失败')) connectionFailed++;
