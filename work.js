@@ -332,17 +332,7 @@ async function processIpQueue(env) {
       }
       const uniqueIps = [...byIp.keys()];
 
-      const resolved = new Map(); // cleanIp -> 结果字符串
-      let batchStatus = 'ok';
-
-      // 批量查询（每次最多 100 个 IP）
-      for (let i = 0; i < uniqueIps.length; i += BATCH_MAX_IPS) {
-        const batch = uniqueIps.slice(i, i + BATCH_MAX_IPS);
-        const out = await getIpLocationBatch(batch);
-        for (const [k, v] of out.results) resolved.set(k, v);
-        batchStatus = out.status;
-        if (batchStatus !== 'ok') break;
-      }
+      const { resolved, status: batchStatus } = await resolveIpLocations(uniqueIps);
 
       if (batchStatus === 'rate_limited') {
         // 批量接口限流：本轮全部标记待重试，等下一分钟再处理
@@ -596,6 +586,7 @@ const RETRY_DELAY_MS = 5 * 60 * 1000; // 失败项 5 分钟后可再次处理
 
 // 批量 IP 归属地接口（ip-api.com 免费批量，POST，每次最多 100 个 IP）
 const BATCH_API_URL = 'http://ip-api.com/batch';
+const BATCH_API_URL_SECONDARY = 'https://countries.dev/ip?fields=name';
 const BATCH_MAX_IPS = 100; // 单次批量请求最多 IP 数
 // 定时触发：区分「重新拉取上游」与「增量处理 IP」
 const AGGREGATE_CRON = '0 */3 * * *'; // 每 3 小时拉取一次上游订阅
@@ -658,10 +649,10 @@ async function getIpLocationBatch(cleanIps) {
     const data = await resp.json();
     const results = new Map();
     if (Array.isArray(data)) {
-      for (const item of data) {
-        if (!item || item.status !== 'success') continue;
-        const ip = item.query;
-        if (!ip) continue;
+      for (let i = 0; i < data.length; i++) {
+        const item = data[i];
+        const ip = cleanIps[i];
+        if (!item || item.status !== 'success' || !ip) continue;
         const providerInfo = `${item.as || ''} ${item.isp || ''} ${item.org || ''}`;
         if (/\bAS13335\b/i.test(providerInfo) || /cloudflare/i.test(providerInfo)) {
           continue;
@@ -676,6 +667,69 @@ async function getIpLocationBatch(cleanIps) {
     console.error('[IP API] batch query failed:', e.message);
     return { results: new Map(), status: 'error' };
   }
+}
+
+// 第二个批量接口（countries.dev，免 key，最多 100 个 IP；结果覆盖 ip-api 的同名 IP）
+async function getIpLocationBatchSecondary(cleanIps) {
+  try {
+    const resp = await fetchWithTimeout(BATCH_API_URL_SECONDARY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(cleanIps)
+    }, 5000);
+
+    if (!resp.ok) {
+      if (resp.status === 429) {
+        console.log('[IP API] secondary batch rate-limited (HTTP 429)');
+        return { results: new Map(), status: 'rate_limited' };
+      }
+      return { results: new Map(), status: 'error' };
+    }
+
+    const data = await resp.json();
+    const results = new Map();
+    if (Array.isArray(data)) {
+      for (let i = 0; i < data.length; i++) {
+        const item = data[i];
+        const ip = cleanIps[i];
+        if (!item || !item.countryCode || !ip) continue;
+        const code = String(item.countryCode).toUpperCase();
+        const name = countryCodeMap[code] || (item.country && item.country.name) || '未知';
+        results.set(ip, `${code}${name}`);
+      }
+    }
+    return { results, status: 'ok' };
+  } catch (e) {
+    console.error('[IP API] secondary batch query failed:', e.message);
+    return { results: new Map(), status: 'error' };
+  }
+}
+
+// 并行查询两个批量接口并合并结果（countries.dev 优先），任一接口不可用不影响另一个
+async function resolveIpLocations(uniqueIps) {
+  const resolved = new Map();
+  let status = 'ok';
+
+  for (let i = 0; i < uniqueIps.length; i += BATCH_MAX_IPS) {
+    const batch = uniqueIps.slice(i, i + BATCH_MAX_IPS);
+    const [primary, secondary] = await Promise.all([
+      getIpLocationBatch(batch),
+      getIpLocationBatchSecondary(batch)
+    ]);
+
+    for (const [k, v] of primary.results) resolved.set(k, v);
+    for (const [k, v] of secondary.results) resolved.set(k, v);
+
+    if (primary.results.size === 0 && secondary.results.size === 0 &&
+        primary.status !== 'ok' && secondary.status !== 'ok') {
+      status = primary.status === 'rate_limited' || secondary.status === 'rate_limited'
+        ? 'rate_limited'
+        : 'error';
+      break;
+    }
+  }
+
+  return { resolved, status };
 }
 
 // 查询 IP 的地区（本地限速 + 退避；主接口额度用完/限流时自动切备用，备用也限流才停止）
