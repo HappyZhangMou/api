@@ -208,10 +208,9 @@ async function aggregateLinks(env) {
   const [oldCached, oldHash] = await Promise.all([
     env.LINKS_KV.get('cached_aggregate'),
     env.LINKS_KV.get('upstream_hash')
-  const result = outcome.result && getCountryResultKey(outcome.result) ? outcome.result : null;
+  ]);
   if (oldCached && oldHash === upstreamHash) return oldCached;
-    result,
-    issue: result ? null : `${api.name}${outcome.reason || '未识别国家'}`
+
   const markedLines = allLines.map(line => extractIp(line) ? `${line}#未处理` : line);
 
   // 3. 组装初始输出并立即写入缓存
