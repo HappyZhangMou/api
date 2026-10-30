@@ -180,7 +180,7 @@ async function aggregateLinks(env, ctx) {
     throw new Error(errorOutput);
   }
 
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(allLines.join('\n')));
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`geo-v2\n${allLines.join('\n')}`));
   const upstreamHash = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
   const [oldCached, oldHash] = await Promise.all([
     env.LINKS_KV.get('cached_aggregate'),
@@ -662,6 +662,10 @@ async function getIpLocationBatch(cleanIps) {
         if (!item || item.status !== 'success') continue;
         const ip = item.query;
         if (!ip) continue;
+        const providerInfo = `${item.as || ''} ${item.isp || ''} ${item.org || ''}`;
+        if (/\bAS13335\b/i.test(providerInfo) || /cloudflare/i.test(providerInfo)) {
+          continue;
+        }
         const code = String(item.countryCode || '').toUpperCase();
         const name = countryCodeMap[code] || item.country || '未知';
         results.set(ip, `${code}${name}`);
