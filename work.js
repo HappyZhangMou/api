@@ -123,6 +123,21 @@ async function handleSave(request, env, ctx, corsHeaders) {
 
 // ==================== 核心聚合逻辑（两阶段：先快速缓存，后台处理 IP） ====================
 
+// 并发受限的 map：保持结果顺序，避免一次性打满连接数
+async function mapWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function aggregateLinks(env, ctx) {
   const links = await env.LINKS_KV.get('links');
   if (!links || !links.trim()) {
@@ -142,36 +157,44 @@ async function aggregateLinks(env, ctx) {
   let successCount = 0;
   const errors = [];
 
-  // 1. 拉取所有上游链接（带超时）
-  for (const url of urls) {
+  // 1. 并行拉取上游链接（受并发与子请求预算限制）
+  const fetchTargets = urls.slice(0, AGGREGATE_FETCH_BUDGET);
+  if (urls.length > fetchTargets.length) {
+    errors.push(`# 已跳过 ${urls.length - fetchTargets.length} 个上游链接（单次拉取预算 ${AGGREGATE_FETCH_BUDGET}）`);
+  }
+
+  const fetched = await mapWithConcurrency(fetchTargets, AGGREGATE_CONCURRENCY, async url => {
     try {
       const response = await fetchWithTimeout(url, {
-        headers: { 
+        headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         },
         cf: { cacheTtl: 60 }
       }, 8000);
-      
+
       if (!response.ok) {
-        errors.push(`# Error: HTTP ${response.status} for ${url}`);
-        continue;
+        return { error: `# Error: HTTP ${response.status} for ${url}` };
       }
-      
-      const text = await response.text();
-      successCount++;
-      
-      const lines = text.split('\n');
-      for (const line of lines) {
-        const idx = line.indexOf('#');
-        const processed = idx >= 0 ? line.substring(0, idx).trim() : line.trim();
-        
-        if (processed && !seen.has(processed)) {
-          seen.add(processed);
-          allLines.push(processed);
-        }
-      }
+      return { text: await response.text() };
     } catch (e) {
-      errors.push(`# Error fetching ${url}: ${e.message}`);
+      return { error: `# Error fetching ${url}: ${e.message}` };
+    }
+  });
+
+  for (const item of fetched) {
+    if (item.error) {
+      errors.push(item.error);
+      continue;
+    }
+    successCount++;
+    for (const line of item.text.split('\n')) {
+      const idx = line.indexOf('#');
+      const processed = idx >= 0 ? line.substring(0, idx).trim() : line.trim();
+
+      if (processed && !seen.has(processed)) {
+        seen.add(processed);
+        allLines.push(processed);
+      }
     }
   }
 
@@ -274,8 +297,6 @@ async function processIpQueue(env) {
 
       const pendingItems = [];
       let changed = false;
-      // 每轮只测少量节点，避免单次定时任务占用过久。
-      const MAX_PER_RUN = 4;
 
       // 收集本轮待处理项
       for (let i = 0; i < lines.length && pendingItems.length < MAX_PER_RUN; i++) {
@@ -341,9 +362,12 @@ async function processIpQueue(env) {
           failedCount++;
         }
       } else {
-        // ok 或 error：批量未覆盖的 IP 用单个接口降级
+        // 批量未覆盖的 IP 用单个接口降级，预算按子请求核算
         const missing = uniqueIps.filter(ip => !resolved.has(ip));
-        let budget = batchStatus === 'error' ? MAX_IP_PER_RUN : missing.length;
+        const fallbackBudget = Math.max(0, Math.floor(
+          (SUBREQUEST_BUDGET - BATCH_SUBREQUESTS_PER_RUN - pendingItems.length) / FALLBACK_SUBREQUESTS_PER_IP
+        ));
+        let budget = Math.min(missing.length, fallbackBudget);
         for (const ip of missing) {
           if (budget <= 0) break;
           budget--;
@@ -356,6 +380,9 @@ async function processIpQueue(env) {
           const result = resolved.get(clean);
           if (result === undefined) {
             return { line: `${item.line}#分析失败-待重试@${Date.now()}`, failed: true };
+          }
+          if (result === CLOUDFLARE_MARK) {
+            return { line: `${item.line}#Cloudflare`, cloudflare: true };
           }
           if (result.startsWith('CN')) return { line: null, deleted: true };
 
@@ -580,8 +607,22 @@ const apiUsage = new Map();
 const API_WINDOW_MS = 60 * 1000;
 const API_PRIMARY_LIMIT = 30; // 主接口本地限速（保守）；额度用完后自动切备用接口
 
-// 批量接口不可用时的降级处理上限（逐个查询，受 Free 版 50 次子请求限制）
-const MAX_IP_PER_RUN = 45;
+// 每轮处理的节点数（同时决定测速并发与降级预算）
+const MAX_PER_RUN = 4;
+// 单次 invocation 的外部子请求预算（Free 版上限 50，预留 5 次给 KV/杂项）
+const SUBREQUEST_BUDGET = 45;
+// 每轮批量查询固定消耗：ip-api + countries.dev 各 1 次
+const BATCH_SUBREQUESTS_PER_RUN = 2;
+// 单个 IP 降级查询最多消耗：uapis.cn + ipwho.is 各 1 次
+const FALLBACK_SUBREQUESTS_PER_IP = 2;
+// 上游拉取并发（与 6 个并发连接上限对齐）
+const AGGREGATE_CONCURRENCY = 6;
+// 上游拉取预算：预留后续 IP 处理（批量 + 降级 + 测速）所需子请求
+const AGGREGATE_FETCH_BUDGET = Math.max(0,
+  SUBREQUEST_BUDGET - BATCH_SUBREQUESTS_PER_RUN - MAX_PER_RUN * FALLBACK_SUBREQUESTS_PER_IP - MAX_PER_RUN
+);
+// ip-api 判定为 Cloudflare(AS13335) 的 IP 用此标记，不再当普通地区节点
+const CLOUDFLARE_MARK = 'CLOUDFLARE';
 const RETRY_DELAY_MS = 5 * 60 * 1000; // 失败项 5 分钟后可再次处理
 
 // 批量 IP 归属地接口（ip-api.com 免费批量，POST，每次最多 100 个 IP）
@@ -629,7 +670,7 @@ function fetchWithTimeout(resource, options = {}, timeoutMs = 5000) {
 }
 
 // 批量查询 IP 归属地（ip-api.com 免费批量接口，一次最多 100 个 IP）
-// 返回 { results: Map<ip, 结果字符串>, status: 'ok' | 'rate_limited' | 'error' }
+// 返回 { results: Map<ip, 结果字符串>, blocked: Set<Cloudflare IP>, status: 'ok' | 'rate_limited' | 'error' }
 async function getIpLocationBatch(cleanIps) {
   try {
     const resp = await fetchWithTimeout(BATCH_API_URL, {
@@ -641,13 +682,14 @@ async function getIpLocationBatch(cleanIps) {
     if (!resp.ok) {
       if (resp.status === 429) {
         console.log('[IP API] batch rate-limited (HTTP 429)');
-        return { results: new Map(), status: 'rate_limited' };
+        return { results: new Map(), blocked: new Set(), status: 'rate_limited' };
       }
-      return { results: new Map(), status: 'error' };
+      return { results: new Map(), blocked: new Set(), status: 'error' };
     }
 
     const data = await resp.json();
     const results = new Map();
+    const blocked = new Set();
     if (Array.isArray(data)) {
       for (let i = 0; i < data.length; i++) {
         const item = data[i];
@@ -655,6 +697,7 @@ async function getIpLocationBatch(cleanIps) {
         if (!item || item.status !== 'success' || !ip) continue;
         const providerInfo = `${item.as || ''} ${item.isp || ''} ${item.org || ''}`;
         if (/\bAS13335\b/i.test(providerInfo) || /cloudflare/i.test(providerInfo)) {
+          blocked.add(ip);
           continue;
         }
         const code = String(item.countryCode || '').toUpperCase();
@@ -662,10 +705,10 @@ async function getIpLocationBatch(cleanIps) {
         results.set(ip, `${code}${name}`);
       }
     }
-    return { results, status: 'ok' };
+    return { results, blocked, status: 'ok' };
   } catch (e) {
     console.error('[IP API] batch query failed:', e.message);
-    return { results: new Map(), status: 'error' };
+    return { results: new Map(), blocked: new Set(), status: 'error' };
   }
 }
 
@@ -705,7 +748,7 @@ async function getIpLocationBatchSecondary(cleanIps) {
   }
 }
 
-// 并行查询两个批量接口并合并结果（countries.dev 优先），任一接口不可用不影响另一个
+// 并行查询两个批量接口并合并结果（countries.dev 优先；Cloudflare 标记优先于两者）
 async function resolveIpLocations(uniqueIps) {
   const resolved = new Map();
   let status = 'ok';
@@ -719,8 +762,10 @@ async function resolveIpLocations(uniqueIps) {
 
     for (const [k, v] of primary.results) resolved.set(k, v);
     for (const [k, v] of secondary.results) resolved.set(k, v);
+    for (const ip of primary.blocked) resolved.set(ip, CLOUDFLARE_MARK);
 
     if (primary.results.size === 0 && secondary.results.size === 0 &&
+        primary.blocked.size === 0 &&
         primary.status !== 'ok' && secondary.status !== 'ok') {
       status = primary.status === 'rate_limited' || secondary.status === 'rate_limited'
         ? 'rate_limited'
