@@ -211,7 +211,8 @@ async function aggregateLinks(env) {
   ]);
   if (oldCached && oldHash === upstreamHash) return oldCached;
 
-  const markedLines = allLines.map(line => extractIp(line) ? `${line}#未处理` : line);
+  // IP 与优选域名都要测速：只要能被解析成测速端点，就进入待处理队列。
+  const markedLines = allLines.map(line => parseEndpoint(line) ? `${line}#未处理` : line);
 
   // 3. 组装初始输出并立即写入缓存
   let output = markedLines.join('\n');
@@ -280,6 +281,7 @@ async function processIpQueue(env) {
 
     let processedCount = 0;
     let failedCount = 0;
+    let conflictedCount = 0;
     let deletedCount = 0;
     let skippedCount = 0;
     let speedFailedCount = 0;
@@ -314,13 +316,18 @@ async function processIpQueue(env) {
         }
 
         if (contentWithoutMark !== null) {
-          const ip = extractIp(contentWithoutMark);
-          if (ip) {
-            pendingItems.push({ index: i, line: contentWithoutMark, ip });
-          } else {
+          const endpoint = parseEndpoint(contentWithoutMark);
+          if (!endpoint) {
             lines[i] = contentWithoutMark;
             changed = true;
             skippedCount++;
+          } else {
+            pendingItems.push({
+              index: i,
+              line: contentWithoutMark,
+              ip: extractIp(contentWithoutMark),
+              endpoint
+            });
           }
         }
       }
@@ -335,16 +342,25 @@ async function processIpQueue(env) {
         return;
       }
 
-      // 按干净 IP 去重分组：同一 IP 只查一次，结果应用到所有行
+      // 按干净 IP 去重分组：同一 IP 只查一次，结果应用到所有行；域名行不参与归属地查询
       const byIp = new Map();
       for (const item of pendingItems) {
+        if (!item.ip) continue;
         const clean = getCleanIp(item.ip);
         if (!byIp.has(clean)) byIp.set(clean, []);
         byIp.get(clean).push(item);
       }
       const uniqueIps = [...byIp.keys()];
 
-      const { resolved, unresolved, status: batchStatus } = await resolveIpLocations(uniqueIps);
+      let resolved = new Map();
+      let unresolved = new Map();
+      let batchStatus = 'ok';
+      if (uniqueIps.length > 0) {
+        const lookup = await resolveIpLocations(uniqueIps);
+        resolved = lookup.resolved;
+        unresolved = lookup.unresolved;
+        batchStatus = lookup.status;
+      }
       if (batchStatus !== 'ok') {
         console.warn(`[IP API] batch lookup status: ${batchStatus}; unresolved IPs will be retried later.`);
       }
@@ -353,10 +369,21 @@ async function processIpQueue(env) {
       }
 
       const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
+        // 优选域名只测延迟，不查归属地，也不参与 CN 过滤
+        if (!item.ip) {
+          const speed = await measureEndpoint(item.endpoint);
+          if (speed.error) return { line: null, deleted: true };
+          return { line: `${item.line}|${speed.latencyMs}ms` };
+        }
+
         const clean = getCleanIp(item.ip);
         const result = resolved.get(clean);
         if (result === undefined) {
-          const reason = unresolved.get(clean)?.reason || '批量接口未返回有效归属';
+          const info = unresolved.get(clean);
+          const reason = info?.reason || '批量接口未返回有效归属';
+          if (info?.conflict) {
+            return { line: `${item.line}#归属冲突（${reason}）`, conflicted: true };
+          }
           return { line: `${item.line}#分析失败-待重试（${reason}）@${Date.now()}`, failed: true };
         }
         if (result === CLOUDFLARE_MARK) {
@@ -364,7 +391,7 @@ async function processIpQueue(env) {
         }
         if (result.startsWith('CN')) return { line: null, deleted: true };
 
-        const speed = await measureIpConnection(item.line);
+        const speed = await measureEndpoint(item.endpoint);
         if (speed.error) {
           return { line: `${item.line}#${result}|连接失败`, speedFailed: true };
         }
@@ -374,6 +401,7 @@ async function processIpQueue(env) {
       for (let i = 0; i < pendingItems.length; i++) {
         lines[pendingItems[i].index] = itemResults[i].line;
         if (itemResults[i].failed) failedCount++;
+        else if (itemResults[i].conflicted) conflictedCount++;
         else if (itemResults[i].deleted) deletedCount++;
         else {
           processedCount++;
@@ -385,7 +413,7 @@ async function processIpQueue(env) {
       const filteredLines = lines.filter(line => line !== null);
       await writeCachedAggregate(env, sortLinesByLatency(filteredLines).join('\n'));
 
-      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
+      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Conflicted: ${conflictedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
     } finally {
       await releaseLock(env);
     }
@@ -431,8 +459,8 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
     let retryCount = 0;
 
     const updatedLines = lines.map(line => {
-      // 支持多种失败标记：#分析失败、#分析失败-待重试 或 带时间戳的 #分析失败-待重试@<ts>
-      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#[^#]*\|连接失败)$/);
+      // 支持多种标记：#分析失败、#分析失败-待重试（可带原因/时间戳）、#归属冲突、连接失败
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#归属冲突（[^）]*）|#[^#]*\|连接失败)$/);
       if (match) {
         retryCount++;
         return match[1] + '#未处理';
@@ -465,16 +493,22 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
   }
 }
 
-async function measureIpConnection(line) {
-  const bracketed = line.match(/\[([0-9a-fA-F:]+)\](?::(\d+))?/);
-  const ipv4 = line.match(/\b(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?\b/);
-  const endpoint = bracketed || ipv4;
-  if (!endpoint) return { error: '未找到可测速 IP' };
-
-  const hostname = endpoint[1];
-  const port = Number(endpoint[2] || 443);
+async function measureEndpoint(endpoint) {
+  if (!endpoint) return { error: '未找到可测速端点' };
+  const { hostname, port } = endpoint;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { error: '端口无效' };
 
+  const samples = [];
+  for (let attempt = 0; attempt < SPEED_TEST_ATTEMPTS; attempt++) {
+    const sample = await measureOnce(hostname, port);
+    if (sample.error) return sample;
+    samples.push(sample.latencyMs);
+  }
+  const average = Math.round(samples.reduce((sum, value) => sum + value, 0) / samples.length);
+  return { latencyMs: Math.max(1, average) };
+}
+
+async function measureOnce(hostname, port) {
   let socket;
   let timeout;
   const startedAt = Date.now();
@@ -493,6 +527,31 @@ async function measureIpConnection(line) {
     clearTimeout(timeout);
     if (socket) await socket.close().catch(() => {});
   }
+}
+
+// 解析测速端点：优先 IP，其次域名。域名行仅用于延迟测试，不参与归属地查询。
+function parseEndpoint(line) {
+  const bracketed = line.match(/\[([0-9a-fA-F:]+)\](?::(\d+))?/);
+  if (bracketed && isValidIPv6(bracketed[1])) {
+    return { hostname: bracketed[1], port: normalizePort(bracketed[2]) };
+  }
+
+  const ipv4 = line.match(/\b(\d{1,3}(?:\.\d{1,3}){3})(?::(\d+))?\b/);
+  if (ipv4 && isValidIPv4(ipv4[1])) {
+    return { hostname: ipv4[1], port: normalizePort(ipv4[2]) };
+  }
+
+  const host = line.match(/^([a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+)(?::(\d+))?$/);
+  if (host) {
+    return { hostname: host[1].toLowerCase(), port: normalizePort(host[2]) };
+  }
+
+  return null;
+}
+
+function normalizePort(value) {
+  const port = Number(value || 443);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : 0;
 }
 
 // 管理端：强制触发后台处理（用于排查和即时处理）
@@ -576,6 +635,8 @@ const BATCH_MAX_IPS = 100;
 // 每轮批量归属查询上限；测速使用独立并发限制。
 const MAX_PER_RUN = BATCH_MAX_IPS;
 const SPEED_TEST_CONCURRENCY = 6;
+// 每个端点测速次数，取算术平均，降低单次抖动影响。
+const SPEED_TEST_ATTEMPTS = 3;
 // 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
 const SUBREQUEST_BUDGET = 44;
 // 上游拉取并发（与 6 个并发连接上限对齐）
@@ -641,7 +702,6 @@ async function getIpLocationBatch(cleanIps) {
 
     if (!resp.ok) {
       if (resp.status === 429) {
-    contentWithoutMark = retryMatch[1];
         return { results: new Map(), blocked: new Set(), status: 'rate_limited' };
       }
       return { results: new Map(), blocked: new Set(), status: 'error' };
@@ -779,6 +839,9 @@ async function resolveIpLocations(uniqueIps) {
         const returned = sources
           .map(source => `${source.name}:${getCountryResultKey(source.result) || '-'}`)
           .filter(source => !source.endsWith(':-'));
+        const distinctCodes = new Set(
+          sources.map(source => getCountryResultKey(source.result)).filter(Boolean)
+        );
         if (returned.length > 1) {
           reasons.push(`批量结果无多数(${returned.join(',')})`);
         }
@@ -787,7 +850,11 @@ async function resolveIpLocations(uniqueIps) {
             reasons.push(getLookupFailureReason(source.name, source.status));
           }
         }
-        unresolved.set(ip, { reason: reasons.join('、') || '批量接口未达成多数' });
+        unresolved.set(ip, {
+          reason: reasons.join('、') || '批量接口未达成多数',
+          // 三家都返回了结果但互相不同 → 数据本身矛盾，重试无意义；否则视为查询失败可重试。
+          conflict: distinctCodes.size >= 2
+        });
       }
     }
 
@@ -890,6 +957,7 @@ async function handleAdmin(env) {
     let unprocessed = 0;
     let failed = 0;
     let failedRetry = 0;
+    let conflicted = 0;
     let connectionFailed = 0;
     
     for (const line of allLines) {
@@ -897,14 +965,15 @@ async function handleAdmin(env) {
       if (!trimmed || trimmed.startsWith('#')) continue;
       totalLines++;
       if (trimmed.endsWith('#未处理')) unprocessed++;
+      else if (/#归属冲突（[^）]*）$/.test(trimmed)) conflicted++;
       else if (/#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?$/.test(trimmed)) {
         if (trimmed.endsWith('#分析失败')) failed++;
         else failedRetry++;
       } else if (trimmed.endsWith('|连接失败')) connectionFailed++;
     }
     
-    const processed = totalLines - unprocessed - failed - failedRetry - connectionFailed;
-    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，地区失败 ${failed}，连接失败 ${connectionFailed}）`;
+    const processed = totalLines - unprocessed - failed - failedRetry - conflicted - connectionFailed;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，归属冲突 ${conflicted}，地区失败 ${failed}，连接失败 ${connectionFailed}）`;
   }
   
   // API 成功率统计功能已移除
