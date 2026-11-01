@@ -503,11 +503,19 @@ async function measureEndpoint(endpoint) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { error: '端口无效' };
 
   const samples = [];
+  let lastError = null;
   for (let attempt = 0; attempt < SPEED_TEST_ATTEMPTS; attempt++) {
     const sample = await measureOnce(hostname, port);
-    if (sample.error) return sample;
+    if (sample.error) {
+      lastError = sample.error;
+      continue;
+    }
     samples.push(sample.latencyMs);
   }
+
+  // 抖动容忍：只要有成功样本就用成功样本取平均，全部失败才判定失败。
+  if (samples.length === 0) return { error: lastError || '连接失败' };
+
   const average = Math.round(samples.reduce((sum, value) => sum + value, 0) / samples.length);
   return { latencyMs: Math.max(1, average) };
 }
@@ -684,7 +692,7 @@ async function handleFetch(env, corsHeaders, ctx) {
 const BATCH_MAX_IPS = 100;
 // 每轮批量归属查询上限；测速使用独立并发限制。
 const MAX_PER_RUN = BATCH_MAX_IPS;
-const SPEED_TEST_CONCURRENCY = 6;
+const SPEED_TEST_CONCURRENCY = 4;
 // 每个端点测速次数，取算术平均，降低单次抖动影响。
 const SPEED_TEST_ATTEMPTS = 3;
 // 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
