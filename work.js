@@ -67,10 +67,6 @@ async function handleRequest(request, env, ctx) {
     return handleProcessNow(env, ctx, corsHeaders);
   }
 
-  if (url.pathname === '/retry-failed' && request.method === 'POST') {
-    return handleRetryFailed(env, ctx, corsHeaders);
-  }
-
   if (url.pathname === '/reprocess' && request.method === 'POST') {
     return handleReprocess(env, ctx, corsHeaders);
   }
@@ -273,7 +269,7 @@ async function processIpQueue(env) {
     if (!preview) {
       return;
     }
-    const hasPending = /#未处理|#分析失败-待重试/.test(preview);
+    const hasPending = preview.includes('#未处理');
     const previewSorted = sortLinesByLatency(preview.split('\n')).join('\n');
     if (!hasPending && previewSorted === preview) return;
 
@@ -303,26 +299,6 @@ async function processIpQueue(env) {
 
         if (line.endsWith('#未处理')) {
           contentWithoutMark = line.slice(0, -4);
-        } else {
-          const retryMatch = line.match(/^(.*)#分析失败-待重试(?:（([^）]*)）)?(?:@(\d+))?$/);
-          const speedRetryMatch = line.match(/^(.*)\|测速失败-待重试@(\d+)$/);
-          if (retryMatch) {
-            const ts = retryMatch[3] ? parseInt(retryMatch[3], 10) : 0;
-            if (!ts || ts <= Date.now() - RETRY_DELAY_MS) {
-              contentWithoutMark = retryMatch[1];
-            } else {
-              continue; // 未到重试时间
-            }
-          } else if (speedRetryMatch) {
-            const ts = parseInt(speedRetryMatch[2], 10) || 0;
-            if (!ts || ts <= Date.now() - RETRY_DELAY_MS) {
-              contentWithoutMark = speedRetryMatch[1];
-            } else {
-              continue;
-            }
-          } else if (line.endsWith('#UN未知')) {
-            contentWithoutMark = line.slice(0, -5);
-          }
         }
 
         if (contentWithoutMark !== null) {
@@ -372,10 +348,10 @@ async function processIpQueue(env) {
         batchStatus = lookup.status;
       }
       if (batchStatus !== 'ok') {
-        console.warn(`[IP API] batch lookup status: ${batchStatus}; unresolved IPs will be retried later.`);
+        console.warn(`[IP API] batch lookup status: ${batchStatus}; keeping nodes pending to avoid mass deletion.`);
       }
       if (unresolved.size > 0) {
-        console.log(`[IP API] ${unresolved.size} IP(s) were not confirmed by batch consensus.`);
+        console.log(`[IP API] ${unresolved.size} IP(s) had no majority and will be removed.`);
       }
 
       // 批量接口整体不可用（三源全部失败）时不能判定节点无效，保留待处理，避免误删全部节点。
@@ -445,59 +421,6 @@ function sortLinesByLatency(lines) {
       return left.index - right.index;
     })
     .map(item => item.line);
-}
-
-// 睡眠辅助函数
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function handleRetryFailed(env, ctx, corsHeaders) {
-  try {
-    const cached = await env.LINKS_KV.get('cached_aggregate');
-    if (!cached) {
-      return new Response('No cache found', { 
-        status: 404,
-        headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-      });
-    }
-
-    const lines = cached.split('\n');
-    let retryCount = 0;
-
-    const updatedLines = lines.map(line => {
-      // 支持多种标记：#分析失败、#分析失败-待重试（可带原因/时间戳）、#归属冲突、测速失败
-      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#归属冲突（[^）]*）|#测速失败|#[^#|]*\|测速失败-待重试@\d+)$/);
-      if (match) {
-        retryCount++;
-        return match[1] + '#未处理';
-      }
-      return line;
-    });
-
-    if (retryCount === 0) {
-      return new Response('没有分析失败的 IP 需要重试', {
-        headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-      });
-    }
-
-    const updated = updatedLines.join('\n');
-    await writeCachedAggregate(env, updated);
-
-    // 启动后台重新处理
-    if (ctx) {
-      ctx.waitUntil(processIpQueue(env));
-    }
-
-    return new Response(`已将 ${retryCount} 个分析失败的 IP 重新加入队列，后台开始处理`, {
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  } catch (e) {
-    return new Response('Retry Error: ' + e.message, { 
-      status: 500,
-      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
-    });
-  }
 }
 
 async function measureEndpoint(endpoint) {
@@ -617,7 +540,7 @@ async function handleReprocess(env, ctx, corsHeaders) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return line;
 
-      // 程序追加的结果一律在第一个 # 之后（#地区、#未处理、#分析失败…、#归属冲突…、|Nms），整体剥离。
+      // 程序追加的结果一律在第一个 # 之后（如 #地区|Nms、#未处理、#Cloudflare），整体剥离。
       const hashIndex = trimmed.indexOf('#');
       const base = (hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed)
         .replace(/\|[^|]*$/, '')
@@ -650,11 +573,11 @@ async function handleReprocess(env, ctx, corsHeaders) {
 
 // ==================== /fetch 端点（直接返回当前缓存） ====================
 async function handleFetch(env, corsHeaders, ctx) {
-  // 始终直接返回当前缓存内容（可能包含 #未处理、已完成分析、#分析失败 的混合状态）
+  // 始终直接返回当前缓存内容（可能包含 #未处理 与已完成结果混合的状态）
   try {
     const cached = await env.LINKS_KV.get('cached_aggregate');
     if (cached !== null && cached !== undefined) {
-      // 处理进度由 cron 定时任务或 /process-now、/retry-failed 推进；
+      // 处理进度由 cron 定时任务或 /process-now、/reprocess 推进；
       // 这里不再每次访问都触发后台任务，避免并发叠加与子请求/写入浪费
       return new Response(cached, {
         headers: { 
@@ -706,7 +629,6 @@ const AGGREGATE_CONCURRENCY = 6;
 const AGGREGATE_FETCH_BUDGET = SUBREQUEST_BUDGET;
 // ip-api 判定为 Cloudflare(AS13335) 的 IP 用此标记，不再当普通地区节点
 const CLOUDFLARE_MARK = 'CLOUDFLARE';
-const RETRY_DELAY_MS = 5 * 60 * 1000; // 失败项 5 分钟后可再次处理
 
 // 批量 IP 归属地接口（ip-api.com 免费批量，POST，每次最多 100 个 IP）
 const BATCH_API_URL = 'http://ip-api.com/batch';
@@ -1262,33 +1184,6 @@ async function handleAdmin(env) {
         } else {
           status.className = 'status error';
           status.textContent = '✗ 刷新失败: ' + text;
-        }
-      } catch (e) {
-        status.className = 'status error';
-        status.textContent = '✗ 错误: ' + e.message;
-      }
-      
-      btn.disabled = false;
-    }
-    async function retryFailed() {
-      const btn = document.getElementById('retryBtn');
-      const status = document.getElementById('status');
-      
-      btn.disabled = true;
-      status.style.display = 'none';
-      status.textContent = '正在重新拉取上游...';
-      status.className = 'status';
-      status.style.display = 'block';
-      
-      try {
-        const res = await fetch('/refresh', { method: 'POST' });
-        const text = await res.text();
-        if (res.ok) {
-          status.className = 'status success';
-          status.textContent = '✓ ' + text;
-        } else {
-          status.className = 'status error';
-          status.textContent = '✗ 重新拉取失败: ' + text;
         }
       } catch (e) {
         status.className = 'status error';
