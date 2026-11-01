@@ -284,11 +284,9 @@ async function processIpQueue(env) {
     }
 
     let processedCount = 0;
-    let failedCount = 0;
-    let conflictedCount = 0;
+    let deferredCount = 0;
     let deletedCount = 0;
     let skippedCount = 0;
-    let speedFailedCount = 0;
 
     try {
       const current = await env.LINKS_KV.get('cached_aggregate');
@@ -307,12 +305,20 @@ async function processIpQueue(env) {
           contentWithoutMark = line.slice(0, -4);
         } else {
           const retryMatch = line.match(/^(.*)#分析失败-待重试(?:（([^）]*)）)?(?:@(\d+))?$/);
+          const speedRetryMatch = line.match(/^(.*)\|测速失败-待重试@(\d+)$/);
           if (retryMatch) {
             const ts = retryMatch[3] ? parseInt(retryMatch[3], 10) : 0;
             if (!ts || ts <= Date.now() - RETRY_DELAY_MS) {
               contentWithoutMark = retryMatch[1];
             } else {
               continue; // 未到重试时间
+            }
+          } else if (speedRetryMatch) {
+            const ts = parseInt(speedRetryMatch[2], 10) || 0;
+            if (!ts || ts <= Date.now() - RETRY_DELAY_MS) {
+              contentWithoutMark = speedRetryMatch[1];
+            } else {
+              continue;
             }
           } else if (line.endsWith('#UN未知')) {
             contentWithoutMark = line.slice(0, -5);
@@ -372,6 +378,9 @@ async function processIpQueue(env) {
         console.log(`[IP API] ${unresolved.size} IP(s) were not confirmed by batch consensus.`);
       }
 
+      // 批量接口整体不可用（三源全部失败）时不能判定节点无效，保留待处理，避免误删全部节点。
+      const batchUnavailable = batchStatus !== 'ok';
+
       const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
         // 优选域名只测延迟，不查归属地，也不参与 CN 过滤
         if (!item.ip) {
@@ -383,12 +392,12 @@ async function processIpQueue(env) {
         const clean = getCleanIp(item.ip);
         const result = resolved.get(clean);
         if (result === undefined) {
-          const info = unresolved.get(clean);
-          const reason = info?.reason || '批量接口未返回有效归属';
-          if (info?.conflict) {
-            return { line: `${item.line}#归属冲突（${reason}）`, conflicted: true };
+          // 接口故障导致拿不到结果：保留待处理，下次再试
+          if (batchUnavailable) {
+            return { line: `${item.line}#未处理`, deferred: true };
           }
-          return { line: `${item.line}#分析失败-待重试（${reason}）@${Date.now()}`, failed: true };
+          // 归属失败或三源冲突：直接删除
+          return { line: null, deleted: true };
         }
         if (result === CLOUDFLARE_MARK) {
           return { line: `${item.line}#Cloudflare`, cloudflare: true };
@@ -396,28 +405,22 @@ async function processIpQueue(env) {
         if (result.startsWith('CN')) return { line: null, deleted: true };
 
         const speed = await measureEndpoint(item.endpoint);
-        if (speed.error) {
-          return { line: `${item.line}#${result}|连接失败`, speedFailed: true };
-        }
+        if (speed.error) return { line: null, deleted: true };
         return { line: `${item.line}#${result}|${speed.latencyMs}ms` };
       });
 
       for (let i = 0; i < pendingItems.length; i++) {
         lines[pendingItems[i].index] = itemResults[i].line;
-        if (itemResults[i].failed) failedCount++;
-        else if (itemResults[i].conflicted) conflictedCount++;
-        else if (itemResults[i].deleted) deletedCount++;
-        else {
-          processedCount++;
-          if (itemResults[i].speedFailed) speedFailedCount++;
-        }
+        if (itemResults[i].deleted) deletedCount++;
+        else if (itemResults[i].deferred) deferredCount++;
+        else processedCount++;
       }
 
       // 本轮只写回一次 KV（过滤掉已删除的行）
       const filteredLines = lines.filter(line => line !== null);
       await writeCachedAggregate(env, sortLinesByLatency(filteredLines).join('\n'));
 
-      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Speed failed: ${speedFailedCount || 0}, Failed(retry later): ${failedCount}, Conflicted: ${conflictedCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
+      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Deferred: ${deferredCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
     } finally {
       await releaseLock(env);
     }
@@ -463,8 +466,8 @@ async function handleRetryFailed(env, ctx, corsHeaders) {
     let retryCount = 0;
 
     const updatedLines = lines.map(line => {
-      // 支持多种标记：#分析失败、#分析失败-待重试（可带原因/时间戳）、#归属冲突、连接失败
-      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#归属冲突（[^）]*）|#[^#]*\|连接失败)$/);
+      // 支持多种标记：#分析失败、#分析失败-待重试（可带原因/时间戳）、#归属冲突、测速失败
+      const match = line.match(/^(.*)(#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?|#归属冲突（[^）]*）|#测速失败|#[^#|]*\|测速失败-待重试@\d+)$/);
       if (match) {
         retryCount++;
         return match[1] + '#未处理';
@@ -529,7 +532,7 @@ async function measureOnce(hostname, port) {
     await Promise.race([
       socket.opened,
       new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('连接超时')), 3000);
+        timeout = setTimeout(() => reject(new Error('连接超时')), 5000);
       })
     ]);
     return { latencyMs: Math.max(1, Date.now() - startedAt) };
@@ -690,8 +693,8 @@ async function handleFetch(env, corsHeaders, ctx) {
 // ==================== IP 查询相关（保持原有逻辑） ====================
 
 const BATCH_MAX_IPS = 100;
-// 每轮批量归属查询上限；测速使用独立并发限制。
-const MAX_PER_RUN = BATCH_MAX_IPS;
+// 单轮处理的端点上限：每个端点要串行测速多次，规模过大会让后半段集中超时。
+const MAX_PER_RUN = 30;
 const SPEED_TEST_CONCURRENCY = 4;
 // 每个端点测速次数，取算术平均，降低单次抖动影响。
 const SPEED_TEST_ATTEMPTS = 3;
@@ -1013,25 +1016,16 @@ async function handleAdmin(env) {
     const allLines = cached.split('\n');
     let totalLines = 0;
     let unprocessed = 0;
-    let failed = 0;
-    let failedRetry = 0;
-    let conflicted = 0;
-    let connectionFailed = 0;
-    
+
     for (const line of allLines) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
       totalLines++;
       if (trimmed.endsWith('#未处理')) unprocessed++;
-      else if (/#归属冲突（[^）]*）$/.test(trimmed)) conflicted++;
-      else if (/#分析失败(?:-待重试(?:（[^）]*）)?(?:@\d+)?)?$/.test(trimmed)) {
-        if (trimmed.endsWith('#分析失败')) failed++;
-        else failedRetry++;
-      } else if (trimmed.endsWith('|连接失败')) connectionFailed++;
     }
-    
-    const processed = totalLines - unprocessed - failed - failedRetry - conflicted - connectionFailed;
-    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}，待重试 ${failedRetry}，归属冲突 ${conflicted}，地区失败 ${failed}，连接失败 ${connectionFailed}）`;
+
+    const processed = totalLines - unprocessed;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}）`;
   }
   
   // API 成功率统计功能已移除
@@ -1196,7 +1190,6 @@ async function handleAdmin(env) {
       <button onclick="save()" id="saveBtn">保存链接</button>
       <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即拉取并刷新</button>
       <button onclick="processNow()" id="processNowBtn" class="refresh-btn">立即处理</button>
-      <button onclick="retryFailed()" id="retryBtn" class="retry-btn">重试分析失败</button>
       <button onclick="reprocess()" id="reprocessBtn" class="retry-btn">重新处理全部</button>
       <div id="status" class="status"></div>
     </div>
@@ -1210,9 +1203,9 @@ async function handleAdmin(env) {
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|42ms</code>。延迟是 Worker 到目标的 TCP 建连时间，三次取样取平均，不是下载速度</li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
-        <li><strong>失败处理：</strong>优选域名测速失败会被<strong>直接删除</strong>；IP 测速失败保留为 <code>|连接失败</code>，避免网络抖动误删可用节点</li>
-        <li><strong>状态标记：</strong><code>#未处理</code> 排队中；<code>#分析失败-待重试（原因）@时间</code> 接口失败，5 分钟后自动重试；<code>#归属冲突（明细）</code> 三家结果互相矛盾，<strong>不自动重试</strong>，需手动处理；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
-        <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游；「立即处理」推进当前待处理队列；「重试分析失败」仅重置失败项；「重新处理全部」清空所有已完成的归属地与延迟结果并全量重跑（会弹出确认）</li>
+        <li><strong>失败即删除：</strong>归属地无法确认（三源无多数）、测速失败的节点都会被<strong>直接移除</strong>，不再保留失败标记；唯一例外是三个批量接口同时不可用时，节点保持 <code>#未处理</code> 等待下一轮，避免上游故障导致误删</li>
+        <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（可重复点击，用于重新获取并重建列表）；「立即处理」推进当前待处理队列；「重新处理全部」清空所有已完成结果并全量重跑（会弹出确认）</li>
+        <li><strong>状态标记：</strong><code>#未处理</code> 排队中；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
       </ul>
     </div>
   </div>
@@ -1283,19 +1276,19 @@ async function handleAdmin(env) {
       
       btn.disabled = true;
       status.style.display = 'none';
-      status.textContent = '重试中...';
+      status.textContent = '正在重新拉取上游...';
       status.className = 'status';
       status.style.display = 'block';
       
       try {
-        const res = await fetch('/retry-failed', { method: 'POST' });
+        const res = await fetch('/refresh', { method: 'POST' });
         const text = await res.text();
         if (res.ok) {
           status.className = 'status success';
           status.textContent = '✓ ' + text;
         } else {
           status.className = 'status error';
-          status.textContent = '✗ 重试失败: ' + text;
+          status.textContent = '✗ 重新拉取失败: ' + text;
         }
       } catch (e) {
         status.className = 'status error';
