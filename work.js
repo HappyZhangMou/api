@@ -71,6 +71,10 @@ async function handleRequest(request, env, ctx) {
     return handleRetryFailed(env, ctx, corsHeaders);
   }
 
+  if (url.pathname === '/reprocess' && request.method === 'POST') {
+    return handleReprocess(env, ctx, corsHeaders);
+  }
+
   if (url.pathname === '/' || url.pathname === '') {
     const accept = request.headers.get('Accept') || '';
     const userAgent = request.headers.get('User-Agent') || '';
@@ -586,8 +590,54 @@ async function handleProcessNow(env, ctx, corsHeaders) {
   }
 }
 
-// ==================== /fetch 端点（直接返回当前缓存） ====================
+// 重新处理：丢弃所有已有归属/测速结果，把全部可测速端点重新排队。
+async function handleReprocess(env, ctx, corsHeaders) {
+  try {
+    const cached = await env.LINKS_KV.get('cached_aggregate');
+    if (!cached) {
+      return new Response('No cache found', {
+        status: 404,
+        headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
 
+    let resetCount = 0;
+    const updatedLines = cached.split('\n').map(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) return line;
+
+      // 程序追加的结果一律在第一个 # 之后（#地区、#未处理、#分析失败…、#归属冲突…、|Nms），整体剥离。
+      const hashIndex = trimmed.indexOf('#');
+      const base = (hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed)
+        .replace(/\|[^|]*$/, '')
+        .trim();
+
+      if (!parseEndpoint(base)) return line;
+      resetCount++;
+      return `${base}#未处理`;
+    });
+
+    if (resetCount === 0) {
+      return new Response('没有可重新处理的节点', {
+        headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+      });
+    }
+
+    await writeCachedAggregate(env, updatedLines.join('\n'));
+    if (ctx) ctx.waitUntil(processIpQueue(env));
+
+    return new Response(`已将 ${resetCount} 个节点重置为未处理，后台开始重新处理`, {
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  } catch (e) {
+    return new Response('Reprocess Error: ' + e.message, {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+}
+
+// ==================== /fetch 端点（直接返回当前缓存） ====================
 async function handleFetch(env, corsHeaders, ctx) {
   // 始终直接返回当前缓存内容（可能包含 #未处理、已完成分析、#分析失败 的混合状态）
   try {
@@ -1139,23 +1189,22 @@ async function handleAdmin(env) {
       <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即拉取并刷新</button>
       <button onclick="processNow()" id="processNowBtn" class="refresh-btn">立即处理</button>
       <button onclick="retryFailed()" id="retryBtn" class="retry-btn">重试分析失败</button>
+      <button onclick="reprocess()" id="reprocessBtn" class="retry-btn">重新处理全部</button>
       <div id="status" class="status"></div>
     </div>
     
     <div class="tips">
       <h3>使用说明</h3>
       <ul>
-        <li>每行只能填写一个链接</li>
-        <li>以 <code>#</code> 开头的行会被视为注释，跳过不处理</li>
-        <li>访问 <code>/fetch</code> 时，程序会优先返回缓存内容，响应速度极快</li>
-        <li>获取到的内容会自动删除每行原有的 <code>#</code> 后的文字（包括 <code>#</code> 本身）</li>
-        <li>多个链接返回的<strong>相同内容会自动去重</strong>，保留首次出现的顺序</li>
-        <li><strong>IP 连接延迟：</strong>上游内容变化后会重新测试 IP:端口的 TCP 建连时间，结果格式为 <code>#地区|42ms</code>；Cloudflare 出站策略可能拒绝优选 IP 连接</li>
-        <li>示例输出：<code>1.2.3.4:443#JP日本|42ms</code>；连接失败会显示 <code>|连接失败</code>，此值是 Worker 到 IP 的 TCP 延迟，不是下载速度</li>
-        <li><span class="badge badge-new">NEW</span> <strong>后台异步处理：</strong>时间触发器触发后，先快速返回带 <code>#未处理</code> 标记的结果，之后在后台逐个分析 IP 归属地，成功替换为实际地区，失败标记 <code>#分析失败</code></li>
-        <li><span class="badge badge-new">NEW</span> <strong>实时进度：</strong>后台处理期间，外部请求直接返回当前处理进度（已处理 / 未处理 / 分析失败）</li>
-        <li><span class="badge badge-new">NEW</span> <strong>重试失败：</strong>如果某些 IP 分析失败，可点击「重试分析失败」按钮，将这些 IP 重新标记为 <code>#未处理</code> 并再次进入分析流程</li>
-        <li>示例输出：<code>1.2.3.4:443#JP日本|42ms</code>、<code>1.2.3.4:443#未处理</code>、<code>5.6.7.8:80#连接失败</code></li>
+        <li><strong>填写订阅链接：</strong>每行一个链接，以 <code>#</code> 开头的行视为注释跳过；多个链接的相同内容会自动去重，保留首次出现顺序</li>
+        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每分钟的定时任务继续推进</li>
+        <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
+        <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
+        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|42ms</code>。延迟是 Worker 到目标的 TCP 建连时间，三次取样取平均，不是下载速度</li>
+        <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
+        <li><strong>失败处理：</strong>优选域名测速失败会被<strong>直接删除</strong>；IP 测速失败保留为 <code>|连接失败</code>，避免网络抖动误删可用节点</li>
+        <li><strong>状态标记：</strong><code>#未处理</code> 排队中；<code>#分析失败-待重试（原因）@时间</code> 接口失败，5 分钟后自动重试；<code>#归属冲突（明细）</code> 三家结果互相矛盾，<strong>不自动重试</strong>，需手动处理；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
+        <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游；「立即处理」推进当前待处理队列；「重试分析失败」仅重置失败项；「重新处理全部」清空所有已完成的归属地与延迟结果并全量重跑（会弹出确认）</li>
       </ul>
     </div>
   </div>
@@ -1267,6 +1316,36 @@ async function handleAdmin(env) {
         } else {
           status.className = 'status error';
           status.textContent = '✗ 处理失败: ' + text;
+        }
+      } catch (e) {
+        status.className = 'status error';
+        status.textContent = '✗ 错误: ' + e.message;
+      }
+
+      btn.disabled = false;
+    }
+
+    async function reprocess() {
+      const btn = document.getElementById('reprocessBtn');
+      const status = document.getElementById('status');
+
+      if (!confirm('将清空所有已完成的归属地/延迟结果，重新处理全部节点。确定继续吗？')) return;
+
+      btn.disabled = true;
+      status.style.display = 'none';
+      status.textContent = '正在重置并重新处理...';
+      status.className = 'status';
+      status.style.display = 'block';
+
+      try {
+        const res = await fetch('/reprocess', { method: 'POST' });
+        const text = await res.text();
+        if (res.ok) {
+          status.className = 'status success';
+          status.textContent = '✓ ' + text;
+        } else {
+          status.className = 'status error';
+          status.textContent = '✗ 重新处理失败: ' + text;
         }
       } catch (e) {
         status.className = 'status error';
