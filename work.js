@@ -79,6 +79,10 @@ async function handleRequest(request, env, ctx) {
     return handleProbe(url);
   }
 
+  if (url.pathname === '/geo') {
+    return handleGeoProbe(url);
+  }
+
   if (url.pathname === '/' || url.pathname === '') {
     const accept = request.headers.get('Accept') || '';
     const userAgent = request.headers.get('User-Agent') || '';
@@ -629,13 +633,14 @@ async function handleReprocess(env, ctx, corsHeaders) {
 
 // 强制重建：清空 upstream_hash 后重新拉取上游，把所有节点重新入队。
 // 用于节点被大量删除后恢复列表（hash 未变时 /refresh 会直接返回旧缓存）。
+// 注意：不在此处直接处理队列。写入缓存后紧接着测速会被 KV 节流（1.2s/次）拖住，
+// 导致 waitUntil 超时、本轮处理被中断。交给下一次 cron 触发即可。
 async function handleReset(env, ctx, corsHeaders) {
   try {
     await env.LINKS_KV.put('upstream_hash', 'reset-' + Date.now());
     const output = await aggregateLinks(env);
-    if (ctx) ctx.waitUntil(processIpQueue(env));
     const pending = (output.match(/#未处理/g) || []).length;
-    return new Response(`已强制重建，${pending} 个节点重新入队，后台开始处理`, {
+    return new Response(`已强制重建，${pending} 个节点重新入队，将由定时任务继续处理`, {
       headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
     });
   } catch (e) {
@@ -672,6 +677,41 @@ async function handleProbe(url) {
         : `${target}  成功: ${result.latencyMs}ms  (总耗时 ${cost}ms)`
     );
   }
+
+  return new Response(lines.join('\n'), {
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+  });
+}
+
+// 归属诊断端点：对指定 IP 逐个跑三个批量源，返回每源原始结果，便于定位是"源失败"还是"投票无多数"。
+// 用法：/geo?ip=1.2.3.4&ip=5.6.7.8
+async function handleGeoProbe(url) {
+  const ips = url.searchParams.getAll('ip')
+    .map(getCleanIp)
+    .filter(Boolean)
+    .slice(0, 20);
+
+  if (ips.length === 0) {
+    return new Response('用法：/geo?ip=1.2.3.4&ip=5.6.7.8', {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+
+  const [primary, secondary, geojs] = await Promise.all([
+    getIpLocationBatch(ips),
+    getIpLocationBatchSecondary(ips),
+    getIpLocationBatchGeoJs(ips)
+  ]);
+
+  const lines = [];
+  for (const ip of ips) {
+    const p = primary.results.get(ip) || (primary.blocked.has(ip) ? 'CLOUDFLARE' : '-');
+    const s = secondary.results.get(ip) || '-';
+    const g = geojs.results.get(ip) || '-';
+    lines.push(`${ip}\n  ip-api=${p}  countries.dev=${s}  geojs=${g}`);
+  }
+  lines.push('');
+  lines.push(`源状态: ip-api=${primary.status}, countries.dev=${secondary.status}, geojs=${geojs.status}`);
 
   return new Response(lines.join('\n'), {
     headers: { 'Content-Type': 'text/plain; charset=utf-8' }
