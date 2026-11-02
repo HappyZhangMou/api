@@ -469,28 +469,55 @@ async function measureEndpoint(endpoint) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { error: '端口无效' };
 
   const samples = [];
+  let tlsCount = 0;
   let lastError = null;
+
   for (let attempt = 0; attempt < SPEED_TEST_ATTEMPTS; attempt++) {
     const sample = await measureOnce(hostname, port);
     if (sample.error) {
       lastError = sample.error;
+      // 短路：剩余次数已不足以达到稳定性门槛时，没必要继续测。
+      const remaining = SPEED_TEST_ATTEMPTS - attempt - 1;
+      if (samples.length + remaining < STABILITY_MIN_SUCCESS) {
+        return { error: lastError || `仅 ${samples.length}/${SPEED_TEST_ATTEMPTS} 次连通` };
+      }
       continue;
     }
     samples.push(sample.latencyMs);
+    if (sample.tls) tlsCount++;
+  }
+  // 稳定性要求：要求至少 STABILITY_MIN_SUCCESS 次成功。
+  // 之前"成功 1 次即通过"会把抖动严重的节点也留下，实际使用时大量超时。
+  if (samples.length < STABILITY_MIN_SUCCESS) {
+    return { error: lastError || `仅 ${samples.length}/${SPEED_TEST_ATTEMPTS} 次连通` };
   }
 
-  // 抖动容忍：只要有成功样本就取其中最快值（代表可达时的真实延迟），全部失败才判定失败。
-  if (samples.length === 0) return { error: lastError || '连接失败' };
-
-  return { latencyMs: Math.max(1, Math.min(...samples)) };
+  // 取成功样本中最快值，代表可达时的真实延迟。
+  return { latencyMs: Math.max(1, Math.min(...samples)), tls: tlsCount > 0 };
 }
 
+// 单次探测：优先做完整 TLS 握手（能验出"TCP 通但 TLS 不通"的伪可用节点）。
+// 若 TLS 失败但 TCP 可达，则回退为纯 TCP 结果，避免误删非 TLS 代理。
 async function measureOnce(hostname, port) {
+  const tlsResult = await tryConnect(hostname, port, 'on');
+  if (!tlsResult.error) {
+    return { latencyMs: tlsResult.latencyMs, tls: true };
+  }
+
+  const tcpResult = await tryConnect(hostname, port, 'off');
+  if (!tcpResult.error) {
+    return { latencyMs: tcpResult.latencyMs, tls: false };
+  }
+
+  return { error: tlsResult.error || tcpResult.error };
+}
+
+async function tryConnect(hostname, port, secureTransport) {
   let socket;
   let timeout;
   const startedAt = Date.now();
   try {
-    socket = connect({ hostname, port });
+    socket = connect({ hostname, port }, secureTransport === 'on' ? { secureTransport: 'on' } : undefined);
     await Promise.race([
       socket.opened,
       new Promise((_, reject) => {
@@ -748,6 +775,9 @@ const MAX_PER_RUN = 200;
 const SPEED_TEST_CONCURRENCY = 6;
 // 每个端点测速次数：跨境节点首次握手常失败，多次尝试可避免误删。
 const SPEED_TEST_ATTEMPTS = 3;
+// 稳定性门槛：要求至少这么多次成功才算可用。
+// 只成功 1 次的节点在实际使用中极易超时，必须剔除。
+const STABILITY_MIN_SUCCESS = 3;
 // 单轮时间预算：必须小于 cron 周期（5 分钟），否则两轮会重叠，
 // 同一节点被重复测速并互相覆盖写回。留 1 分钟余量给 KV 写入与收尾。
 const CRON_RUN_BUDGET_MS = 4 * 60 * 1000;
@@ -1261,7 +1291,9 @@ async function handleAdmin(env) {
         <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每 5 分钟一次的定时任务继续推进（单轮最多处理 300 个节点，限时 4 分钟）</li>
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
-        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的 TCP 建连时间，多次探测取最快值，不是下载速度</li>
+        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的建连时间，多次探测取最快值</li>
+        <li><strong>有效性验证：</strong>优先做完整 <strong>TLS 握手</strong>（能剔除“TCP 通但 TLS 不通”的伪可用节点）；TLS 不通时回退为纯 TCP 检测，保留非 TLS 代理</li>
+        <li><strong>稳定性门槛：</strong>共测 ${SPEED_TEST_ATTEMPTS} 次，需<strong>全部成功</strong>才算有效。只偶尔连通的节点在实际使用中会大量超时，因此不予保留</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
         <li><strong>失败处理：</strong>归属地未确认或测速失败的节点会<strong>保留为 <code>#未处理</code></strong>，下一轮继续尝试，不会因单轮接口波动被批量清空；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
