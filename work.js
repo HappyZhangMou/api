@@ -22,8 +22,8 @@ export default {
         await aggregateLinks(env);
         console.log('[Scheduled] Aggregation completed.');
       } else {
-        // 每分钟：仅增量处理待处理节点，不重新拉取上游
-        await processIpQueue(env);
+        // 处理节点：cron 触发允许 15 分钟，这里用满 10 分钟以提高单轮吞吐。
+        await processIpQueue(env, CRON_RUN_BUDGET_MS);
       }
     } catch (e) {
       console.error('[Scheduled] failed:', e.message);
@@ -287,7 +287,7 @@ function releaseLock() {
 
 // ==================== 后台 IP 处理队列 ====================
 
-async function processIpQueue(env) {
+async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
   try {
     // 先读一次缓存：没有待处理项就直接返回，避免无谓的加锁与 KV 写入
     const preview = await env.LINKS_KV.get('cached_aggregate');
@@ -395,8 +395,8 @@ async function processIpQueue(env) {
       }
 
       const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
-        // 时间预算耗尽：剩余项保留待处理，交给下一分钟继续，避免 invocation 被强杀导致进度丢失。
-        if (Date.now() - startedAt > RUN_TIME_BUDGET_MS) {
+        // 时间预算耗尽：剩余项保留待处理，交给下一轮继续，避免 invocation 被强杀导致进度丢失。
+        if (Date.now() - startedAt > timeBudgetMs) {
           return { line: `${item.line}#未处理`, deferred: true };
         }
 
@@ -499,7 +499,7 @@ async function measureOnce(hostname, port) {
     await Promise.race([
       socket.opened,
       new Promise((_, reject) => {
-        timeout = setTimeout(() => reject(new Error('连接超时')), 5000);
+        timeout = setTimeout(() => reject(new Error('连接超时')), CONNECT_TIMEOUT_MS);
       })
     ]);
     return { latencyMs: Math.max(1, Date.now() - startedAt) };
@@ -661,13 +661,18 @@ async function handleFetch(env, corsHeaders, ctx) {
 
 const BATCH_MAX_IPS = 100;
 // 单轮处理的端点上限；端点会先去重再测速，实际建连数通常远小于该值。
-const MAX_PER_RUN = 60;
+const MAX_PER_RUN = 300;
 // 并发连接数（Workers 单次调用最多 6 个同时建连，留 1 个余量）。
 const SPEED_TEST_CONCURRENCY = 5;
 // 每个端点测速次数，取算术平均，降低单次抖动影响。
 const SPEED_TEST_ATTEMPTS = 2;
-// 单轮时间预算：waitUntil 路径只有 30 秒，留足余量避免被中途中断。
-const RUN_TIME_BUDGET_MS = 20000;
+// 单轮时间预算：必须小于 cron 周期（5 分钟），否则两轮会重叠，
+// 同一节点被重复测速并互相覆盖写回。留 1 分钟余量给 KV 写入与收尾。
+const CRON_RUN_BUDGET_MS = 4 * 60 * 1000;
+const HTTP_RUN_BUDGET_MS = 25000;
+// 单次建连超时：正常节点 <250ms 即可返回，2 秒足够；
+// 超时越短，不可达节点越快失败，整体吞吐越高。
+const CONNECT_TIMEOUT_MS = 2000;
 // 延迟保留区间（含端点）：低于下限或高于上限的节点会被删除。
 const LATENCY_MIN_MS = 50;
 const LATENCY_MAX_MS = 250;// 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
@@ -1169,7 +1174,7 @@ async function handleAdmin(env) {
       <h3>使用说明</h3>
       <ul>
         <li><strong>填写订阅链接：</strong>每行一个链接，以 <code>#</code> 开头的行视为注释跳过；多个链接的相同内容会自动去重，保留首次出现顺序</li>
-        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每分钟的定时任务继续推进</li>
+        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每 5 分钟一次的定时任务继续推进（单轮最多处理 300 个节点，限时 4 分钟）</li>
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的 TCP 建连时间，多次取样取平均，不是下载速度</li>
