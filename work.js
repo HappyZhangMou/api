@@ -240,13 +240,46 @@ async function aggregateLinks(env) {
 }
 
 // 同一 key 每秒最多写 1 次；这里强制最小间隔，避免手动连点或多个入口并发写导致 429。
-// 注意：不要用模块级变量统计每日写入量——Workers 每次 invocation 可能落在新 isolate，
-// 变量会重置，这类"预算"既不准也拦不住问题，只保留必要的节流。
 const MIN_WRITE_INTERVAL_MS = 1200;
 let lastWriteAt = 0;
 let pendingWrite = Promise.resolve();
 
+// Free 计划每天仅 1000 次 KV 写入。每分钟处理一轮会达到 1440 次，
+// 因此用 KV 自身记录当天的写入次数（read-modify-write），超过阈值就跳过写入。
+// 缓存内容会稍滞后，但避免整个命名空间写入失败导致列表完全无法更新。
+const DAILY_WRITE_LIMIT = 800;
+let writeBudgetKey = '';
+let writeBudgetCount = 0;
+let writeBudgetLoaded = false;
+
+async function loadWriteBudget(env) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (writeBudgetLoaded && writeBudgetKey === today) return;
+  try {
+    const raw = await env.LINKS_KV.get('write_budget');
+    if (raw) {
+      const [day, count] = raw.split(':');
+      if (day === today) writeBudgetCount = Number(count) || 0;
+      else writeBudgetCount = 0;
+    } else {
+      writeBudgetCount = 0;
+    }
+    writeBudgetKey = today;
+    writeBudgetLoaded = true;
+  } catch (e) {
+    // 读取失败时退化为不限制，避免因预算机制阻塞正常写入。
+    writeBudgetKey = today;
+    writeBudgetLoaded = true;
+  }
+}
+
 async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
+  await loadWriteBudget(env);
+  if (writeBudgetCount >= DAILY_WRITE_LIMIT) {
+    console.warn(`[Cache] daily write budget reached (${writeBudgetCount}), skip write.`);
+    return null;
+  }
+
   // 串行化 + 最小间隔，满足 KV 同 key 1 次/秒的限制。
   const run = async () => {
     const wait = MIN_WRITE_INTERVAL_MS - (Date.now() - lastWriteAt);
@@ -254,6 +287,12 @@ async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
     try {
       await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: ttl });
       lastWriteAt = Date.now();
+      writeBudgetCount++;
+      // 每 20 次才持久化一次计数，减少额外写入。
+      if (writeBudgetCount % 20 === 1) {
+        env.LINKS_KV.put('write_budget', `${writeBudgetKey}:${writeBudgetCount}`, { expirationTtl: 60 * 60 * 30 })
+          .catch(() => {});
+      }
       return lastWriteAt;
     } catch (e) {
       console.error('[Cache] writeCachedAggregate failed:', e.message);
@@ -471,9 +510,11 @@ async function measureEndpoint(endpoint) {
   const samples = [];
   let tlsCount = 0;
   let lastError = null;
+  // 首次探测确定协议；之后只测成功过的协议，避免反复等 TLS 超时。
+  let preferred = null;
 
   for (let attempt = 0; attempt < SPEED_TEST_ATTEMPTS; attempt++) {
-    const sample = await measureOnce(hostname, port);
+    const sample = await measureOnce(hostname, port, preferred);
     if (sample.error) {
       lastError = sample.error;
       // 短路：剩余次数已不足以达到稳定性门槛时，没必要继续测。
@@ -483,8 +524,9 @@ async function measureEndpoint(endpoint) {
       }
       continue;
     }
-    samples.push(sample.latencyMs);
     if (sample.tls) tlsCount++;
+    if (preferred === null) preferred = sample.tls ? 'tls' : 'tcp';
+    samples.push(sample.latencyMs);
   }
   // 稳定性要求：要求至少 STABILITY_MIN_SUCCESS 次成功。
   // 之前"成功 1 次即通过"会把抖动严重的节点也留下，实际使用时大量超时。
@@ -496,20 +538,23 @@ async function measureEndpoint(endpoint) {
   return { latencyMs: Math.max(1, Math.min(...samples)), tls: tlsCount > 0 };
 }
 
-// 单次探测：优先做完整 TLS 握手（能验出"TCP 通但 TLS 不通"的伪可用节点）。
-// 若 TLS 失败但 TCP 可达，则回退为纯 TCP 结果，避免误删非 TLS 代理。
-async function measureOnce(hostname, port) {
+// 单次探测：TCP 快速筛选 → TLS 验证。
+// TCP 不通直接失败（最省时间）；TCP 通再验 TLS。
+// TLS 结果决定 tls 标记：true 表示可完成 TLS 握手（真正可承载代理流量）。
+async function measureOnce(hostname, port, preferred = null) {
+  if (preferred === 'tcp') {
+    const r = await tryConnect(hostname, port, 'off');
+    return r.error ? r : { latencyMs: r.latencyMs, tls: false };
+  }
+
+  const tcpResult = await tryConnect(hostname, port, 'off');
+  if (tcpResult.error) return tcpResult;
+
   const tlsResult = await tryConnect(hostname, port, 'on');
   if (!tlsResult.error) {
     return { latencyMs: tlsResult.latencyMs, tls: true };
   }
-
-  const tcpResult = await tryConnect(hostname, port, 'off');
-  if (!tcpResult.error) {
-    return { latencyMs: tcpResult.latencyMs, tls: false };
-  }
-
-  return { error: tlsResult.error || tcpResult.error };
+  return { latencyMs: tcpResult.latencyMs, tls: false };
 }
 
 async function tryConnect(hostname, port, secureTransport) {
@@ -778,9 +823,9 @@ const SPEED_TEST_ATTEMPTS = 3;
 // 稳定性门槛：要求至少这么多次成功才算可用。
 // 只成功 1 次的节点在实际使用中极易超时，必须剔除。
 const STABILITY_MIN_SUCCESS = 3;
-// 单轮时间预算：必须小于 cron 周期（5 分钟），否则两轮会重叠，
-// 同一节点被重复测速并互相覆盖写回。留 1 分钟余量给 KV 写入与收尾。
-const CRON_RUN_BUDGET_MS = 4 * 60 * 1000;
+// 单轮时间预算：cron 每分钟触发一次，预算留 5 秒余量，
+// 这样处理是持续进行的（上一轮刚结束，下一轮 1 分钟后接上），不会长时间空闲。
+const CRON_RUN_BUDGET_MS = 55 * 1000;
 const HTTP_RUN_BUDGET_MS = 25000;
 // 单次建连超时：跨境节点建立 TLS 连接可能需 1-4 秒，2 秒会误判大量可用节点。
 const CONNECT_TIMEOUT_MS = 4000;
@@ -803,7 +848,7 @@ const BATCH_API_URL_SECONDARY = 'https://countries.dev/ip?fields=name';
 const BATCH_API_URL_GEOJS = 'https://get.geojs.io/v1/ip/country.json?ip=';
 // 定时触发：区分「重新拉取上游」与「增量处理 IP」
 const AGGREGATE_CRON = '0 */3 * * *'; // 每 3 小时拉取一次上游订阅
-const PROCESS_CRON = '*/5 * * * *'; // 每 5 分钟处理一批（Free 计划 KV 写入额度有限）
+const PROCESS_CRON = '* * * * *'; // 每分钟处理一批，实现持续执行
 
 // 国家代码到中文的映射（常用）
 const countryCodeMap = {
@@ -1288,11 +1333,11 @@ async function handleAdmin(env) {
       <h3>使用说明</h3>
       <ul>
         <li><strong>填写订阅链接：</strong>每行一个链接，以 <code>#</code> 开头的行视为注释跳过；多个链接的相同内容会自动去重，保留首次出现顺序</li>
-        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每 5 分钟一次的定时任务继续推进（单轮最多处理 300 个节点，限时 4 分钟）</li>
+        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由<strong>每分钟</strong>的定时任务持续推进（每轮最多 55 秒）</li>
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的建连时间，多次探测取最快值</li>
-        <li><strong>有效性验证：</strong>优先做完整 <strong>TLS 握手</strong>（能剔除“TCP 通但 TLS 不通”的伪可用节点）；TLS 不通时回退为纯 TCP 检测，保留非 TLS 代理</li>
+        <li><strong>有效性验证：</strong>先用 <strong>TCP 快速筛选</strong>（不通立即跳过），再对可达节点做 <strong>TLS 握手验证</strong>，能剔除“TCP 通但 TLS 不通”的伪可用节点</li>
         <li><strong>稳定性门槛：</strong>共测 ${SPEED_TEST_ATTEMPTS} 次，需<strong>全部成功</strong>才算有效。只偶尔连通的节点在实际使用中会大量超时，因此不予保留</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
