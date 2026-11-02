@@ -71,6 +71,10 @@ async function handleRequest(request, env, ctx) {
     return handleReprocess(env, ctx, corsHeaders);
   }
 
+  if (url.pathname === '/reset' && request.method === 'POST') {
+    return handleReset(env, ctx, corsHeaders);
+  }
+
   if (url.pathname === '/' || url.pathname === '') {
     const accept = request.headers.get('Accept') || '';
     const userAgent = request.headers.get('User-Agent') || '';
@@ -613,6 +617,25 @@ async function handleReprocess(env, ctx, corsHeaders) {
     });
   } catch (e) {
     return new Response('Reprocess Error: ' + e.message, {
+      status: 500,
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+}
+
+// 强制重建：清空 upstream_hash 后重新拉取上游，把所有节点重新入队。
+// 用于节点被大量删除后恢复列表（hash 未变时 /refresh 会直接返回旧缓存）。
+async function handleReset(env, ctx, corsHeaders) {
+  try {
+    await env.LINKS_KV.put('upstream_hash', 'reset-' + Date.now());
+    const output = await aggregateLinks(env);
+    if (ctx) ctx.waitUntil(processIpQueue(env));
+    const pending = (output.match(/#未处理/g) || []).length;
+    return new Response(`已强制重建，${pending} 个节点重新入队，后台开始处理`, {
+      headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  } catch (e) {
+    return new Response('Reset Error: ' + e.message, {
       status: 500,
       headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
     });
@@ -1172,6 +1195,7 @@ async function handleAdmin(env) {
       <button onclick="refreshCache()" id="refreshBtn" class="refresh-btn">立即拉取并刷新</button>
       <button onclick="processNow()" id="processNowBtn" class="refresh-btn">立即处理</button>
       <button onclick="reprocess()" id="reprocessBtn" class="retry-btn">重新处理全部</button>
+      <button onclick="forceReset()" id="resetBtn" class="retry-btn">强制重建</button>
       <div id="status" class="status"></div>
     </div>
     
@@ -1182,11 +1206,11 @@ async function handleAdmin(env) {
         <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每 5 分钟一次的定时任务继续推进（单轮最多处理 300 个节点，限时 4 分钟）</li>
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
-        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的 TCP 建连时间，多次取样取平均，不是下载速度</li>
+        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的 TCP 建连时间，多次探测取最快值，不是下载速度</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
         <li><strong>失败即删除：</strong>归属地无法确认（三源无多数）、测速失败的节点都会被<strong>直接移除</strong>，不再保留失败标记；唯一例外是三个批量接口同时不可用时，节点保持 <code>#未处理</code> 等待下一轮，避免上游故障导致误删</li>
-        <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（可重复点击，用于重新获取并重建列表）；「立即处理」推进当前待处理队列；「重新处理全部」清空所有已完成结果并全量重跑（会弹出确认）</li>
+        <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（内容未变时不重建）；「立即处理」推进当前待处理队列；「重新处理全部」清空已完成结果并重跑当前列表；「强制重建」忽略内容哈希，重新拉取上游并把全部节点重新入队（节点被大量删除后用它恢复）</li>
         <li><strong>状态标记：</strong><code>#未处理</code> 排队中；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
       </ul>
     </div>
@@ -1302,6 +1326,36 @@ async function handleAdmin(env) {
         } else {
           status.className = 'status error';
           status.textContent = '✗ 重新处理失败: ' + text;
+        }
+      } catch (e) {
+        status.className = 'status error';
+        status.textContent = '✗ 错误: ' + e.message;
+      }
+
+      btn.disabled = false;
+    }
+
+    async function forceReset() {
+      const btn = document.getElementById('resetBtn');
+      const status = document.getElementById('status');
+
+      if (!confirm('将忽略内容哈希，重新拉取上游并把全部节点重新入队。确定继续吗？')) return;
+
+      btn.disabled = true;
+      status.style.display = 'none';
+      status.textContent = '正在强制重建...';
+      status.className = 'status';
+      status.style.display = 'block';
+
+      try {
+        const res = await fetch('/reset', { method: 'POST' });
+        const text = await res.text();
+        if (res.ok) {
+          status.className = 'status success';
+          status.textContent = '✓ ' + text;
+        } else {
+          status.className = 'status error';
+          status.textContent = '✗ 强制重建失败: ' + text;
         }
       } catch (e) {
         status.className = 'status error';
