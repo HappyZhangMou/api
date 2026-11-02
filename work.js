@@ -674,8 +674,8 @@ const HTTP_RUN_BUDGET_MS = 25000;
 // 超时越短，不可达节点越快失败，整体吞吐越高。
 const CONNECT_TIMEOUT_MS = 2000;
 // 延迟保留区间（含端点）：低于下限或高于上限的节点会被删除。
-const LATENCY_MIN_MS = 50;
-const LATENCY_MAX_MS = 250;// 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
+const LATENCY_MIN_MS = 1;
+const LATENCY_MAX_MS = 10000;// 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
 const SUBREQUEST_BUDGET = 44;
 // 上游拉取并发（与 6 个并发连接上限对齐）
 const AGGREGATE_CONCURRENCY = 6;
