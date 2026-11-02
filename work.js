@@ -228,36 +228,61 @@ async function aggregateLinks(env) {
 }
 
 // 辅助：统一写入缓存。只写一个 key，减少 KV 每日写入次数。
+// Free 计划每天仅 1000 次写入，因此这里做每日写入预算保护：
+// 预算耗尽后跳过写入（缓存内容会略滞后，但不会因超限导致整个命名空间写入失败）。
+const DAILY_WRITE_BUDGET = 900; // 留 100 次余量给 links/upstream_hash 等
+// 同一 key 每秒最多写 1 次；这里强制最小间隔，避免手动连点或多个入口并发写导致 429。
+const MIN_WRITE_INTERVAL_MS = 1200;
+let writeDayKey = '';
+let writeCountToday = 0;
+let lastWriteAt = 0;
+let pendingWrite = Promise.resolve();
+
 async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
-  try {
-    await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: ttl });
-    return Date.now();
-  } catch (e) {
-    console.error('[Cache] writeCachedAggregate failed:', e.message);
-    throw e;
+  const dayKey = new Date().toISOString().slice(0, 10);
+  if (dayKey !== writeDayKey) {
+    writeDayKey = dayKey;
+    writeCountToday = 0;
   }
+  if (writeCountToday >= DAILY_WRITE_BUDGET) {
+    console.warn(`[Cache] Daily write budget exhausted (${writeCountToday}), skip write.`);
+    return null;
+  }
+
+  // 串行化 + 最小间隔，满足 KV 同 key 1 次/秒的限制。
+  const run = async () => {
+    const wait = MIN_WRITE_INTERVAL_MS - (Date.now() - lastWriteAt);
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+    try {
+      await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: ttl });
+      writeCountToday++;
+      lastWriteAt = Date.now();
+      return lastWriteAt;
+    } catch (e) {
+      console.error('[Cache] writeCachedAggregate failed:', e.message);
+      throw e;
+    }
+  };
+
+  const task = pendingWrite.then(run, run);
+  pendingWrite = task.catch(() => {});
+  return task;
 }
 
-// 简易 KV 锁：防止多个入口并发处理同一批 IP 导致覆盖写入。
-// 带 TTL，实例异常退出也会自动过期，避免死锁。
-async function tryAcquireLock(env, ttl = 120) {
-  try {
-    const existing = await env.LINKS_KV.get('processing_lock');
-    if (existing === '1') return false;
-    await env.LINKS_KV.put('processing_lock', '1', { expirationTtl: ttl });
-    return true;
-  } catch (e) {
-    console.error('[Lock] tryAcquireLock failed:', e.message);
-    return false;
-  }
+// 实例内处理锁：替代 KV 锁。KV 锁每轮要 2 次写入（put+delete），
+// 在 Free 计划每天仅 1000 次写入的额度下不可接受。
+// 该锁只在当前 isolate 内有效，配合每分钟 cron 已足够避免同一实例内的重复处理；
+// 即使多实例同时处理，写回是整份覆盖且结果幂等，最坏情况只是重复测速。
+let localProcessing = false;
+
+function tryAcquireLock() {
+  if (localProcessing) return false;
+  localProcessing = true;
+  return true;
 }
 
-async function releaseLock(env) {
-  try {
-    await env.LINKS_KV.delete('processing_lock');
-  } catch (e) {
-    console.error('[Lock] releaseLock failed:', e.message);
-  }
+function releaseLock() {
+  localProcessing = false;
 }
 
 // ==================== 后台 IP 处理队列 ====================
@@ -273,12 +298,11 @@ async function processIpQueue(env) {
     const previewSorted = sortLinesByLatency(preview.split('\n')).join('\n');
     if (!hasPending && previewSorted === preview) return;
 
-    // 抢锁：防止 cron / 手动 / retry 等多个入口并发处理、互相覆盖
-    if (!(await tryAcquireLock(env))) {
+    // 实例内锁：防止同一实例的 cron / 手动入口并发处理
+    if (!tryAcquireLock()) {
       console.log('[Queue] Another run is in progress, skip.');
       return;
     }
-
     let processedCount = 0;
     let deferredCount = 0;
     let deletedCount = 0;
@@ -292,30 +316,28 @@ async function processIpQueue(env) {
       const pendingItems = [];
       let changed = false;
 
-      // 收集本轮待处理项
-      for (let i = 0; i < lines.length && pendingItems.length < MAX_PER_RUN; i++) {
+      // 收集本轮待处理项：只扫一遍，遇到 #未处理 即收集，凑够上限就停。
+      for (let i = 0; i < lines.length; i++) {
+        if (pendingItems.length >= MAX_PER_RUN) break;
+
         const line = lines[i];
-        let contentWithoutMark = null;
+        if (!line.endsWith('#未处理')) continue;
 
-        if (line.endsWith('#未处理')) {
-          contentWithoutMark = line.slice(0, -4);
+        const contentWithoutMark = line.slice(0, -4);
+        const endpoint = parseEndpoint(contentWithoutMark);
+        if (!endpoint) {
+          lines[i] = contentWithoutMark;
+          changed = true;
+          skippedCount++;
+          continue;
         }
-
-        if (contentWithoutMark !== null) {
-          const endpoint = parseEndpoint(contentWithoutMark);
-          if (!endpoint) {
-            lines[i] = contentWithoutMark;
-            changed = true;
-            skippedCount++;
-          } else {
-            pendingItems.push({
-              index: i,
-              line: contentWithoutMark,
-              ip: extractIp(contentWithoutMark),
-              endpoint
-            });
-          }
-        }
+        pendingItems.push({
+          index: i,
+          line: contentWithoutMark,
+          ip: extractIp(contentWithoutMark),
+          endpoint,
+          key: `${endpoint.hostname}:${endpoint.port}`
+        });
       }
 
       if (pendingItems.length === 0) {
@@ -357,11 +379,32 @@ async function processIpQueue(env) {
       // 批量接口整体不可用（三源全部失败）时不能判定节点无效，保留待处理，避免误删全部节点。
       const batchUnavailable = batchStatus !== 'ok';
 
+      // 端点级去重：同一 hostname:port 只测速一次，结果共享给所有重复行。
+      const speedCache = new Map();
+      const startedAt = Date.now();
+
+      async function getSpeed(key, endpoint) {
+        if (speedCache.has(key)) return speedCache.get(key);
+        const promise = measureEndpoint(endpoint);
+        speedCache.set(key, promise);
+        return promise;
+      }
+
+      function withinLatencyRange(latencyMs) {
+        return latencyMs >= LATENCY_MIN_MS && latencyMs <= LATENCY_MAX_MS;
+      }
+
       const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
+        // 时间预算耗尽：剩余项保留待处理，交给下一分钟继续，避免 invocation 被强杀导致进度丢失。
+        if (Date.now() - startedAt > RUN_TIME_BUDGET_MS) {
+          return { line: `${item.line}#未处理`, deferred: true };
+        }
+
         // 优选域名只测延迟，不查归属地，也不参与 CN 过滤
         if (!item.ip) {
-          const speed = await measureEndpoint(item.endpoint);
+          const speed = await getSpeed(item.key, item.endpoint);
           if (speed.error) return { line: null, deleted: true };
+          if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true };
           return { line: `${item.line}|${speed.latencyMs}ms` };
         }
 
@@ -380,8 +423,9 @@ async function processIpQueue(env) {
         }
         if (result.startsWith('CN')) return { line: null, deleted: true };
 
-        const speed = await measureEndpoint(item.endpoint);
+        const speed = await getSpeed(item.key, item.endpoint);
         if (speed.error) return { line: null, deleted: true };
+        if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true };
         return { line: `${item.line}#${result}|${speed.latencyMs}ms` };
       });
 
@@ -398,7 +442,7 @@ async function processIpQueue(env) {
 
       console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Deferred: ${deferredCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
     } finally {
-      await releaseLock(env);
+      releaseLock();
     }
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
@@ -616,12 +660,17 @@ async function handleFetch(env, corsHeaders, ctx) {
 // ==================== IP 查询相关（保持原有逻辑） ====================
 
 const BATCH_MAX_IPS = 100;
-// 单轮处理的端点上限：每个端点要串行测速多次，规模过大会让后半段集中超时。
-const MAX_PER_RUN = 30;
-const SPEED_TEST_CONCURRENCY = 4;
+// 单轮处理的端点上限；端点会先去重再测速，实际建连数通常远小于该值。
+const MAX_PER_RUN = 60;
+// 并发连接数（Workers 单次调用最多 6 个同时建连，留 1 个余量）。
+const SPEED_TEST_CONCURRENCY = 5;
 // 每个端点测速次数，取算术平均，降低单次抖动影响。
-const SPEED_TEST_ATTEMPTS = 3;
-// 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
+const SPEED_TEST_ATTEMPTS = 2;
+// 单轮时间预算：waitUntil 路径只有 30 秒，留足余量避免被中途中断。
+const RUN_TIME_BUDGET_MS = 20000;
+// 延迟保留区间（含端点）：低于下限或高于上限的节点会被删除。
+const LATENCY_MIN_MS = 50;
+const LATENCY_MAX_MS = 250;// 单次 invocation 的外部子请求预算（Free 版上限 50，预留 6 次给 KV/杂项）
 const SUBREQUEST_BUDGET = 44;
 // 上游拉取并发（与 6 个并发连接上限对齐）
 const AGGREGATE_CONCURRENCY = 6;
@@ -636,7 +685,7 @@ const BATCH_API_URL_SECONDARY = 'https://countries.dev/ip?fields=name';
 const BATCH_API_URL_GEOJS = 'https://get.geojs.io/v1/ip/country.json?ip=';
 // 定时触发：区分「重新拉取上游」与「增量处理 IP」
 const AGGREGATE_CRON = '0 */3 * * *'; // 每 3 小时拉取一次上游订阅
-const PROCESS_CRON = '* * * * *'; // 每分钟处理一批 IP
+const PROCESS_CRON = '*/5 * * * *'; // 每 5 分钟处理一批（Free 计划 KV 写入额度有限）
 
 // 国家代码到中文的映射（常用）
 const countryCodeMap = {
@@ -1123,7 +1172,8 @@ async function handleAdmin(env) {
         <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由每分钟的定时任务继续推进</li>
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
-        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|42ms</code>。延迟是 Worker 到目标的 TCP 建连时间，三次取样取平均，不是下载速度</li>
+        <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的 TCP 建连时间，多次取样取平均，不是下载速度</li>
+        <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
         <li><strong>失败即删除：</strong>归属地无法确认（三源无多数）、测速失败的节点都会被<strong>直接移除</strong>，不再保留失败标记；唯一例外是三个批量接口同时不可用时，节点保持 <code>#未处理</code> 等待下一轮，避免上游故障导致误删</li>
         <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（可重复点击，用于重新获取并重建列表）；「立即处理」推进当前待处理队列；「重新处理全部」清空所有已完成结果并全量重跑（会弹出确认）</li>
