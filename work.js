@@ -1264,7 +1264,7 @@ async function handleAdmin(env) {
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的 TCP 建连时间，多次探测取最快值，不是下载速度</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
-        <li><strong>失败即删除：</strong>归属地无法确认（三源无多数）、测速失败的节点都会被<strong>直接移除</strong>，不再保留失败标记；唯一例外是三个批量接口同时不可用时，节点保持 <code>#未处理</code> 等待下一轮，避免上游故障导致误删</li>
+        <li><strong>失败处理：</strong>归属地未确认或测速失败的节点会<strong>保留为 <code>#未处理</code></strong>，下一轮继续尝试，不会因单轮接口波动被批量清空；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
         <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（内容未变时不重建）；「立即处理」推进当前待处理队列；「重新处理全部」清空已完成结果并重跑当前列表；「强制重建」忽略内容哈希，重新拉取上游并把全部节点重新入队（节点被大量删除后用它恢复）</li>
         <li><strong>状态标记：</strong><code>#未处理</code> 排队中；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
       </ul>
