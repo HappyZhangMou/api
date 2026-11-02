@@ -403,8 +403,8 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
         // 优选域名只测延迟，不查归属地，也不参与 CN 过滤
         if (!item.ip) {
           const speed = await getSpeed(item.key, item.endpoint);
-          if (speed.error) return { line: null, deleted: true };
-          if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true };
+          if (speed.error) return { line: null, deleted: true, reason: 'domain-speed-fail' };
+          if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true, reason: 'domain-latency' };
           return { line: `${item.line}|${speed.latencyMs}ms` };
         }
 
@@ -416,23 +416,27 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
             return { line: `${item.line}#未处理`, deferred: true };
           }
           // 归属失败或三源冲突：直接删除
-          return { line: null, deleted: true };
+          return { line: null, deleted: true, reason: unresolved.has(clean) ? 'geo-no-majority' : 'geo-missing' };
         }
         if (result === CLOUDFLARE_MARK) {
           return { line: `${item.line}#Cloudflare`, cloudflare: true };
         }
-        if (result.startsWith('CN')) return { line: null, deleted: true };
+        if (result.startsWith('CN')) return { line: null, deleted: true, reason: 'cn' };
 
         const speed = await getSpeed(item.key, item.endpoint);
-        if (speed.error) return { line: null, deleted: true };
-        if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true };
+        if (speed.error) return { line: null, deleted: true, reason: 'speed-fail' };
+        if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true, reason: 'latency' };
         return { line: `${item.line}#${result}|${speed.latencyMs}ms` };
       });
 
+      const deleteReasons = new Map();
       for (let i = 0; i < pendingItems.length; i++) {
         lines[pendingItems[i].index] = itemResults[i].line;
-        if (itemResults[i].deleted) deletedCount++;
-        else if (itemResults[i].deferred) deferredCount++;
+        if (itemResults[i].deleted) {
+          deletedCount++;
+          const r = itemResults[i].reason || 'unknown';
+          deleteReasons.set(r, (deleteReasons.get(r) || 0) + 1);
+        } else if (itemResults[i].deferred) deferredCount++;
         else processedCount++;
       }
 
@@ -440,7 +444,8 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
       const filteredLines = lines.filter(line => line !== null);
       await writeCachedAggregate(env, sortLinesByLatency(filteredLines).join('\n'));
 
-      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Deferred: ${deferredCount}, Deleted: ${deletedCount}, Skipped: ${skippedCount}`);
+      const reasonText = [...deleteReasons.entries()].map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
+      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Deferred: ${deferredCount}, Deleted: ${deletedCount} [${reasonText}], Skipped: ${skippedCount}`);
     } finally {
       releaseLock();
     }
