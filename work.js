@@ -483,11 +483,10 @@ async function measureEndpoint(endpoint) {
     samples.push(sample.latencyMs);
   }
 
-  // 抖动容忍：只要有成功样本就用成功样本取平均，全部失败才判定失败。
+  // 抖动容忍：只要有成功样本就取其中最快值（代表可达时的真实延迟），全部失败才判定失败。
   if (samples.length === 0) return { error: lastError || '连接失败' };
 
-  const average = Math.round(samples.reduce((sum, value) => sum + value, 0) / samples.length);
-  return { latencyMs: Math.max(1, average) };
+  return { latencyMs: Math.max(1, Math.min(...samples)) };
 }
 
 async function measureOnce(hostname, port) {
@@ -660,22 +659,19 @@ async function handleFetch(env, corsHeaders, ctx) {
 // ==================== IP 查询相关（保持原有逻辑） ====================
 
 const BATCH_MAX_IPS = 100;
-// 单轮处理的端点上限；端点会先去重再测速，实际建连数通常远小于该值。
-const MAX_PER_RUN = 300;
-// 并发连接数（Workers 单次调用最多 6 个同时建连，留 1 个余量）。
-const SPEED_TEST_CONCURRENCY = 5;
-// 每个端点测速次数，取算术平均，降低单次抖动影响。
-const SPEED_TEST_ATTEMPTS = 2;
+// 单轮处理的端点上限：受时间预算约束，过大会导致尾部节点全部超时。
+const MAX_PER_RUN = 200;
+// 并发连接数：Workers 单次调用最多 6 个同时建连，用满 6 个。
+const SPEED_TEST_CONCURRENCY = 6;
+// 每个端点测速次数：跨境节点首次握手常失败，多次尝试可避免误删。
+const SPEED_TEST_ATTEMPTS = 3;
 // 单轮时间预算：必须小于 cron 周期（5 分钟），否则两轮会重叠，
 // 同一节点被重复测速并互相覆盖写回。留 1 分钟余量给 KV 写入与收尾。
 const CRON_RUN_BUDGET_MS = 4 * 60 * 1000;
 const HTTP_RUN_BUDGET_MS = 25000;
-// 单次建连超时：正常节点 <250ms 即可返回，2 秒足够；
-// 超时越短，不可达节点越快失败，整体吞吐越高。
-const CONNECT_TIMEOUT_MS = 2000;
-// 延迟保留区间（含端点）：低于下限或高于上限的节点会被删除。
-// 延迟保留区间（含端点）：低于下限或高于上限的节点会被删除。
-// 下限不宜过高：Cloudflare 边缘节点到目标常在 10-60ms，50ms 会误删大量可用节点；
+// 单次建连超时：跨境节点建立 TLS 连接可能需 1-4 秒，2 秒会误判大量可用节点。
+const CONNECT_TIMEOUT_MS = 4000;
+// 延迟保留区间（含端点）：下限不宜过高，Cloudflare 边缘到目标常在 10-60ms；
 // 只有极低值（<10ms）才基本可判定为劫持/本地回环。
 const LATENCY_MIN_MS = 10;
 const LATENCY_MAX_MS = 800;
