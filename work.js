@@ -239,35 +239,20 @@ async function aggregateLinks(env) {
   return output;
 }
 
-// 辅助：统一写入缓存。只写一个 key，减少 KV 每日写入次数。
-// Free 计划每天仅 1000 次写入，因此这里做每日写入预算保护：
-// 预算耗尽后跳过写入（缓存内容会略滞后，但不会因超限导致整个命名空间写入失败）。
-const DAILY_WRITE_BUDGET = 900; // 留 100 次余量给 links/upstream_hash 等
 // 同一 key 每秒最多写 1 次；这里强制最小间隔，避免手动连点或多个入口并发写导致 429。
+// 注意：不要用模块级变量统计每日写入量——Workers 每次 invocation 可能落在新 isolate，
+// 变量会重置，这类"预算"既不准也拦不住问题，只保留必要的节流。
 const MIN_WRITE_INTERVAL_MS = 1200;
-let writeDayKey = '';
-let writeCountToday = 0;
 let lastWriteAt = 0;
 let pendingWrite = Promise.resolve();
 
 async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
-  const dayKey = new Date().toISOString().slice(0, 10);
-  if (dayKey !== writeDayKey) {
-    writeDayKey = dayKey;
-    writeCountToday = 0;
-  }
-  if (writeCountToday >= DAILY_WRITE_BUDGET) {
-    console.warn(`[Cache] Daily write budget exhausted (${writeCountToday}), skip write.`);
-    return null;
-  }
-
   // 串行化 + 最小间隔，满足 KV 同 key 1 次/秒的限制。
   const run = async () => {
     const wait = MIN_WRITE_INTERVAL_MS - (Date.now() - lastWriteAt);
     if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
     try {
       await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: ttl });
-      writeCountToday++;
       lastWriteAt = Date.now();
       return lastWriteAt;
     } catch (e) {
@@ -385,11 +370,8 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
         console.warn(`[IP API] batch lookup status: ${batchStatus}; keeping nodes pending to avoid mass deletion.`);
       }
       if (unresolved.size > 0) {
-        console.log(`[IP API] ${unresolved.size} IP(s) had no majority and will be removed.`);
+        console.log(`[IP API] ${unresolved.size} IP(s) not confirmed; kept pending for retry.`);
       }
-
-      // 批量接口整体不可用（三源全部失败）时不能判定节点无效，保留待处理，避免误删全部节点。
-      const batchUnavailable = batchStatus !== 'ok';
 
       // 端点级去重：同一 hostname:port 只测速一次，结果共享给所有重复行。
       const speedCache = new Map();
@@ -423,12 +405,9 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
         const clean = getCleanIp(item.ip);
         const result = resolved.get(clean);
         if (result === undefined) {
-          // 接口故障导致拿不到结果：保留待处理，下次再试
-          if (batchUnavailable) {
-            return { line: `${item.line}#未处理`, deferred: true };
-          }
-          // 归属失败或三源冲突：直接删除
-          return { line: null, deleted: true, reason: unresolved.has(clean) ? 'geo-no-majority' : 'geo-missing' };
+          // 归属未确认：无论是否接口故障，都先保留待处理下轮再试。
+          // 之前的"直接删除"会因单轮接口波动把大量可用节点一次性清空，风险过高。
+          return { line: `${item.line}#未处理`, deferred: true };
         }
         if (result === CLOUDFLARE_MARK) {
           return { line: `${item.line}#Cloudflare`, cloudflare: true };
@@ -436,7 +415,7 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
         if (result.startsWith('CN')) return { line: null, deleted: true, reason: 'cn' };
 
         const speed = await getSpeed(item.key, item.endpoint);
-        if (speed.error) return { line: null, deleted: true, reason: 'speed-fail' };
+        if (speed.error) return { line: `${item.line}#未处理`, deferred: true };
         if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true, reason: 'latency' };
         return { line: `${item.line}#${result}|${speed.latencyMs}ms` };
       });
