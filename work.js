@@ -75,6 +75,10 @@ async function handleRequest(request, env, ctx) {
     return handleReset(env, ctx, corsHeaders);
   }
 
+  if (url.pathname === '/probe') {
+    return handleProbe(url);
+  }
+
   if (url.pathname === '/' || url.pathname === '') {
     const accept = request.headers.get('Accept') || '';
     const userAgent = request.headers.get('User-Agent') || '';
@@ -640,6 +644,38 @@ async function handleReset(env, ctx, corsHeaders) {
       headers: { ...corsHeaders, 'Content-Type': 'text/plain; charset=utf-8' }
     });
   }
+}
+
+// 诊断端点：直接测试指定端点的连通性，返回每次尝试的结果与耗时。
+// 用法：/probe?ip=1.2.3.4:443&ip=5.6.7.8:443
+async function handleProbe(url) {
+  const targets = url.searchParams.getAll('ip').slice(0, 5);
+  if (targets.length === 0) {
+    return new Response('用法：/probe?ip=1.2.3.4:443&ip=5.6.7.8:443', {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+    });
+  }
+
+  const lines = [];
+  for (const target of targets) {
+    const endpoint = parseEndpoint(target);
+    if (!endpoint) {
+      lines.push(`${target}  解析失败`);
+      continue;
+    }
+    const started = Date.now();
+    const result = await measureEndpoint(endpoint);
+    const cost = Date.now() - started;
+    lines.push(
+      result.error
+        ? `${target}  失败: ${result.error}  (耗时 ${cost}ms)`
+        : `${target}  成功: ${result.latencyMs}ms  (总耗时 ${cost}ms)`
+    );
+  }
+
+  return new Response(lines.join('\n'), {
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+  });
 }
 
 // ==================== /fetch 端点（直接返回当前缓存） ====================
