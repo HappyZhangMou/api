@@ -244,42 +244,7 @@ const MIN_WRITE_INTERVAL_MS = 1200;
 let lastWriteAt = 0;
 let pendingWrite = Promise.resolve();
 
-// Free 计划每天仅 1000 次 KV 写入。每分钟处理一轮会达到 1440 次，
-// 因此用 KV 自身记录当天的写入次数（read-modify-write），超过阈值就跳过写入。
-// 缓存内容会稍滞后，但避免整个命名空间写入失败导致列表完全无法更新。
-const DAILY_WRITE_LIMIT = 800;
-let writeBudgetKey = '';
-let writeBudgetCount = 0;
-let writeBudgetLoaded = false;
-
-async function loadWriteBudget(env) {
-  const today = new Date().toISOString().slice(0, 10);
-  if (writeBudgetLoaded && writeBudgetKey === today) return;
-  try {
-    const raw = await env.LINKS_KV.get('write_budget');
-    if (raw) {
-      const [day, count] = raw.split(':');
-      if (day === today) writeBudgetCount = Number(count) || 0;
-      else writeBudgetCount = 0;
-    } else {
-      writeBudgetCount = 0;
-    }
-    writeBudgetKey = today;
-    writeBudgetLoaded = true;
-  } catch (e) {
-    // 读取失败时退化为不限制，避免因预算机制阻塞正常写入。
-    writeBudgetKey = today;
-    writeBudgetLoaded = true;
-  }
-}
-
 async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
-  await loadWriteBudget(env);
-  if (writeBudgetCount >= DAILY_WRITE_LIMIT) {
-    console.warn(`[Cache] daily write budget reached (${writeBudgetCount}), skip write.`);
-    return null;
-  }
-
   // 串行化 + 最小间隔，满足 KV 同 key 1 次/秒的限制。
   const run = async () => {
     const wait = MIN_WRITE_INTERVAL_MS - (Date.now() - lastWriteAt);
@@ -287,12 +252,6 @@ async function writeCachedAggregate(env, output, ttl = 60 * 60 * 3) {
     try {
       await env.LINKS_KV.put('cached_aggregate', output, { expirationTtl: ttl });
       lastWriteAt = Date.now();
-      writeBudgetCount++;
-      // 每 20 次才持久化一次计数，减少额外写入。
-      if (writeBudgetCount % 20 === 1) {
-        env.LINKS_KV.put('write_budget', `${writeBudgetKey}:${writeBudgetCount}`, { expirationTtl: 60 * 60 * 30 })
-          .catch(() => {});
-      }
       return lastWriteAt;
     } catch (e) {
       console.error('[Cache] writeCachedAggregate failed:', e.message);
@@ -814,8 +773,9 @@ async function handleFetch(env, corsHeaders, ctx) {
 // ==================== IP 查询相关（保持原有逻辑） ====================
 
 const BATCH_MAX_IPS = 100;
-// 单轮处理的端点上限：受时间预算约束，过大会导致尾部节点全部超时。
-const MAX_PER_RUN = 200;
+// 单轮处理的端点上限：4.5 分钟预算下最差情况可处理约 400 个，
+// 设 400 让单轮能覆盖常见规模；上限过高会让尾部节点在预算耗尽时被推迟。
+const MAX_PER_RUN = 400;
 // 并发连接数：Workers 单次调用最多 6 个同时建连，用满 6 个。
 const SPEED_TEST_CONCURRENCY = 6;
 // 每个端点测速次数：跨境节点首次握手常失败，多次尝试可避免误删。
@@ -823,9 +783,10 @@ const SPEED_TEST_ATTEMPTS = 3;
 // 稳定性门槛：要求至少这么多次成功才算可用。
 // 只成功 1 次的节点在实际使用中极易超时，必须剔除。
 const STABILITY_MIN_SUCCESS = 3;
-// 单轮时间预算：cron 每分钟触发一次，预算留 5 秒余量，
-// 这样处理是持续进行的（上一轮刚结束，下一轮 1 分钟后接上），不会长时间空闲。
-const CRON_RUN_BUDGET_MS = 55 * 1000;
+// Free 计划每天仅 1000 次 KV 写入，而 cached_aggregate 每轮最少写 1 次。
+// 每分钟一轮 = 1440 次/天，必然超限并被平台拒绝写入（表现为处理停滞）。
+// 因此改为每 5 分钟一轮、单轮跑满 4.5 分钟：288 次/天，稳定在额度内。
+const CRON_RUN_BUDGET_MS = 270 * 1000;
 const HTTP_RUN_BUDGET_MS = 25000;
 // 单次建连超时：跨境节点建立 TLS 连接可能需 1-4 秒，2 秒会误判大量可用节点。
 const CONNECT_TIMEOUT_MS = 4000;
@@ -848,7 +809,7 @@ const BATCH_API_URL_SECONDARY = 'https://countries.dev/ip?fields=name';
 const BATCH_API_URL_GEOJS = 'https://get.geojs.io/v1/ip/country.json?ip=';
 // 定时触发：区分「重新拉取上游」与「增量处理 IP」
 const AGGREGATE_CRON = '0 */3 * * *'; // 每 3 小时拉取一次上游订阅
-const PROCESS_CRON = '* * * * *'; // 每分钟处理一批，实现持续执行
+const PROCESS_CRON = '*/5 * * * *'; // 每 5 分钟一轮，单轮跑 4.5 分钟（受 KV 写入额度约束）
 
 // 国家代码到中文的映射（常用）
 const countryCodeMap = {
@@ -1333,7 +1294,7 @@ async function handleAdmin(env) {
       <h3>使用说明</h3>
       <ul>
         <li><strong>填写订阅链接：</strong>每行一个链接，以 <code>#</code> 开头的行视为注释跳过；多个链接的相同内容会自动去重，保留首次出现顺序</li>
-        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由<strong>每分钟</strong>的定时任务持续推进（每轮最多 55 秒）</li>
+        <li><strong>读取方式：</strong>访问 <code>/fetch</code> 直接返回缓存，不触发后台任务；未完成项由<strong>每 5 分钟</strong>的定时任务推进（每轮最多 400 个，限时 4.5 分钟）</li>
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的建连时间，多次探测取最快值</li>

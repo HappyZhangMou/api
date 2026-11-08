@@ -5,8 +5,8 @@ workers_dev = false
 preview_urls = false
 
 [triggers]
-# 每分钟处理一批节点（持续执行）；每 3 小时重新拉取上游订阅
-crons = ["* * * * *", "0 */3 * * *"]
+# 每 5 分钟处理一轮（单轮跑 4.5 分钟，控制在 KV 每日写入额度内）；每 3 小时重新拉取上游
+crons = ["*/5 * * * *", "0 */3 * * *"]
 
 [[kv_namespaces]]
 binding = "LINKS_KV"
