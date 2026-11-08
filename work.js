@@ -289,7 +289,7 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
     if (!preview) {
       return;
     }
-    const hasPending = preview.includes('#未处理');
+    const hasPending = preview.includes('#未处理') || preview.includes(PENDING_SPEED_MARK);
     const previewSorted = sortLinesByLatency(preview.split('\n')).join('\n');
     if (!hasPending && previewSorted === preview) return;
 
@@ -298,149 +298,194 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
       console.log('[Queue] Another run is in progress, skip.');
       return;
     }
-    let processedCount = 0;
-    let deferredCount = 0;
-    let deletedCount = 0;
-    let skippedCount = 0;
 
     try {
       const current = await env.LINKS_KV.get('cached_aggregate');
       if (!current) return;
       const lines = current.split('\n');
 
-      const pendingItems = [];
-      let changed = false;
+      // 阶段一：归属地解析（优先）。本轮只要做了归属，就不再测速，
+      // 严格保证"先完成归属、再抽空测速"，避免测速挤占归属的时间预算。
+      const geoStats = await runGeoPhase(env, lines, timeBudgetMs);
+      let changed = geoStats.changed;
 
-      // 收集本轮待处理项：只扫一遍，遇到 #未处理 即收集，凑够上限就停。
-      for (let i = 0; i < lines.length; i++) {
-        if (pendingItems.length >= MAX_PER_RUN) break;
-
-        const line = lines[i];
-        if (!line.endsWith('#未处理')) continue;
-
-        const contentWithoutMark = line.slice(0, -4);
-        const endpoint = parseEndpoint(contentWithoutMark);
-        if (!endpoint) {
-          lines[i] = contentWithoutMark;
-          changed = true;
-          skippedCount++;
-          continue;
-        }
-        pendingItems.push({
-          index: i,
-          line: contentWithoutMark,
-          ip: extractIp(contentWithoutMark),
-          endpoint,
-          key: `${endpoint.hostname}:${endpoint.port}`
-        });
+      // 阶段二：延迟测试。仅当本轮没有可做的归属工作、且归属已全部完成时才进行。
+      let speedStats = { processed: 0, deleted: 0, deferred: 0 };
+      const geoStillPending = lines.some(line => line && line.endsWith('#未处理'));
+      if (geoStats.processed === 0 && !geoStillPending) {
+        speedStats = await runSpeedPhase(lines, timeBudgetMs);
+        changed = changed || speedStats.processed > 0 || speedStats.deleted > 0;
+      } else if (geoStillPending) {
+        console.log('[Queue] Geo phase pending remains; speed phase waits for next round.');
       }
 
-      if (pendingItems.length === 0) {
-        // 即使没有待处理项，也整理已经完成的延迟结果。
-        const sortedLines = sortLinesByLatency(lines);
-        const output = sortedLines.join('\n');
-        if (changed || output !== current) {
-          await writeCachedAggregate(env, output);
-        }
-        return;
-      }
+      if (!changed) return;
 
-      // 按干净 IP 去重分组：同一 IP 只查一次，结果应用到所有行；域名行不参与归属地查询
-      const byIp = new Map();
-      for (const item of pendingItems) {
-        if (!item.ip) continue;
-        const clean = getCleanIp(item.ip);
-        if (!byIp.has(clean)) byIp.set(clean, []);
-        byIp.get(clean).push(item);
-      }
-      const uniqueIps = [...byIp.keys()];
-
-      let resolved = new Map();
-      let unresolved = new Map();
-      let batchStatus = 'ok';
-      if (uniqueIps.length > 0) {
-        const lookup = await resolveIpLocations(uniqueIps);
-        resolved = lookup.resolved;
-        unresolved = lookup.unresolved;
-        batchStatus = lookup.status;
-      }
-      if (batchStatus !== 'ok') {
-        console.warn(`[IP API] batch lookup status: ${batchStatus}; keeping nodes pending to avoid mass deletion.`);
-      }
-      if (unresolved.size > 0) {
-        console.log(`[IP API] ${unresolved.size} IP(s) not confirmed; kept pending for retry.`);
-      }
-
-      // 端点级去重：同一 hostname:port 只测速一次，结果共享给所有重复行。
-      const speedCache = new Map();
-      const startedAt = Date.now();
-
-      async function getSpeed(key, endpoint) {
-        if (speedCache.has(key)) return speedCache.get(key);
-        const promise = measureEndpoint(endpoint);
-        speedCache.set(key, promise);
-        return promise;
-      }
-
-      function withinLatencyRange(latencyMs) {
-        return latencyMs >= LATENCY_MIN_MS && latencyMs <= LATENCY_MAX_MS;
-      }
-
-      const itemResults = await mapWithConcurrency(pendingItems, SPEED_TEST_CONCURRENCY, async item => {
-        // 时间预算耗尽：剩余项保留待处理，交给下一轮继续，避免 invocation 被强杀导致进度丢失。
-        if (Date.now() - startedAt > timeBudgetMs) {
-          return { line: `${item.line}#未处理`, deferred: true };
-        }
-
-        // 优选域名只测延迟，不查归属地，也不参与 CN 过滤
-        if (!item.ip) {
-          const speed = await getSpeed(item.key, item.endpoint);
-          if (speed.error) return { line: null, deleted: true, reason: 'domain-speed-fail' };
-          if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true, reason: 'domain-latency' };
-          return { line: `${item.line}|${speed.latencyMs}ms` };
-        }
-
-        const clean = getCleanIp(item.ip);
-        const result = resolved.get(clean);
-        if (result === undefined) {
-          // 归属未确认：无论是否接口故障，都先保留待处理下轮再试。
-          // 之前的"直接删除"会因单轮接口波动把大量可用节点一次性清空，风险过高。
-          return { line: `${item.line}#未处理`, deferred: true };
-        }
-        if (result === CLOUDFLARE_MARK) {
-          return { line: `${item.line}#Cloudflare`, cloudflare: true };
-        }
-        if (result.startsWith('CN')) return { line: null, deleted: true, reason: 'cn' };
-
-        const speed = await getSpeed(item.key, item.endpoint);
-        if (speed.error) return { line: `${item.line}#未处理`, deferred: true };
-        if (!withinLatencyRange(speed.latencyMs)) return { line: null, deleted: true, reason: 'latency' };
-        return { line: `${item.line}#${result}|${speed.latencyMs}ms` };
-      });
-
-      const deleteReasons = new Map();
-      for (let i = 0; i < pendingItems.length; i++) {
-        lines[pendingItems[i].index] = itemResults[i].line;
-        if (itemResults[i].deleted) {
-          deletedCount++;
-          const r = itemResults[i].reason || 'unknown';
-          deleteReasons.set(r, (deleteReasons.get(r) || 0) + 1);
-        } else if (itemResults[i].deferred) deferredCount++;
-        else processedCount++;
-      }
-
-      // 本轮只写回一次 KV（过滤掉已删除的行）
       const filteredLines = lines.filter(line => line !== null);
       await writeCachedAggregate(env, sortLinesByLatency(filteredLines).join('\n'));
 
-      const reasonText = [...deleteReasons.entries()].map(([k, v]) => `${k}=${v}`).join(', ') || 'none';
-      console.log(`[Queue] Run done. Batch: ${batchStatus}, Processed: ${processedCount}, Deferred: ${deferredCount}, Deleted: ${deletedCount} [${reasonText}], Skipped: ${skippedCount}`);
+      console.log(
+        `[Queue] Run done. Geo: +${geoStats.processed} (deferred ${geoStats.deferred}, deleted ${geoStats.deleted}), ` +
+        `Speed: +${speedStats.processed} (deferred ${speedStats.deferred}, deleted ${speedStats.deleted})`
+      );
     } finally {
       releaseLock();
     }
   } catch (e) {
     console.error('[Queue] Error in processIpQueue:', e.message);
   }
+}
+
+// 阶段一：把 #未处理 解析为归属地，成功则标记 #地区#待测速，交给阶段二。
+async function runGeoPhase(env, lines, timeBudgetMs) {
+  const stats = { processed: 0, deferred: 0, deleted: 0, changed: false };
+  const startedAt = Date.now();
+
+  const pendingItems = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (pendingItems.length >= MAX_GEO_PER_RUN) break;
+    const line = lines[i];
+    if (!line || !line.endsWith('#未处理')) continue;
+
+    const content = line.slice(0, -4);
+    const endpoint = parseEndpoint(content);
+    if (!endpoint) {
+      // 无法解析成测速端点：直接移除，避免永久滞留
+      lines[i] = null;
+      stats.deleted++;
+      stats.changed = true;
+      continue;
+    }
+    pendingItems.push({
+      index: i,
+      line: content,
+      ip: extractIp(content),
+      endpoint,
+      key: `${endpoint.hostname}:${endpoint.port}`
+    });
+  }
+
+  if (pendingItems.length === 0) return stats;
+
+  // 批量归属查询：只关心 IP 行，域名行无需归属
+  const byIp = new Map();
+  for (const item of pendingItems) {
+    if (!item.ip) continue;
+    const clean = getCleanIp(item.ip);
+    if (!byIp.has(clean)) byIp.set(clean, []);
+    byIp.get(clean).push(item);
+  }
+  const uniqueIps = [...byIp.keys()];
+
+  let resolved = new Map();
+  if (uniqueIps.length > 0) {
+    const lookup = await resolveIpLocations(uniqueIps);
+    resolved = lookup.resolved;
+    if (lookup.status !== 'ok') {
+      console.warn(`[IP API] batch lookup status: ${lookup.status}; unresolved kept pending.`);
+    }
+  }
+
+  for (const item of pendingItems) {
+    if (Date.now() - startedAt > timeBudgetMs) {
+      stats.deferred++;
+      continue; // 保持 #未处理
+    }
+
+    // 域名行：无需归属，直接进入测速队列
+    if (!item.ip) {
+      lines[item.index] = `${item.line}${PENDING_SPEED_MARK}`;
+      stats.processed++;
+      stats.changed = true;
+      continue;
+    }
+
+    const clean = getCleanIp(item.ip);
+    const result = resolved.get(clean);
+    if (result === undefined) {
+      // 归属未确认：保留 #未处理，下一轮再试
+      stats.deferred++;
+      continue;
+    }
+    if (result === CLOUDFLARE_MARK) {
+      lines[item.index] = `${item.line}#Cloudflare`;
+      stats.processed++;
+      stats.changed = true;
+      continue;
+    }
+    if (result.startsWith('CN')) {
+      lines[item.index] = null;
+      stats.deleted++;
+      stats.changed = true;
+      continue;
+    }
+
+    lines[item.index] = `${item.line}#${result}${PENDING_SPEED_MARK}`;
+    stats.processed++;
+    stats.changed = true;
+  }
+
+  return stats;
+}
+
+// 阶段二：对已归属的节点测延迟，写回 #地区|Nms；超区间或不通则删除/保留待测。
+async function runSpeedPhase(lines, timeBudgetMs) {
+  const stats = { processed: 0, deferred: 0, deleted: 0 };
+  const startedAt = Date.now();
+
+  const speedCache = new Map();
+  const targets = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (targets.length >= MAX_SPEED_PER_RUN) break;
+    const line = lines[i];
+    if (!line || !line.endsWith(PENDING_SPEED_MARK)) continue;
+    const content = line.slice(0, -PENDING_SPEED_MARK.length);
+    const endpoint = parseEndpoint(content);
+    if (!endpoint) {
+      lines[i] = null;
+      stats.deleted++;
+      continue;
+    }
+    targets.push({ index: i, line: content, endpoint, key: `${endpoint.hostname}:${endpoint.port}` });
+  }
+
+  if (targets.length === 0) return stats;
+
+  function getSpeed(key, endpoint) {
+    if (speedCache.has(key)) return speedCache.get(key);
+    const p = measureEndpoint(endpoint);
+    speedCache.set(key, p);
+    return p;
+  }
+
+  const results = await mapWithConcurrency(targets, SPEED_TEST_CONCURRENCY, async item => {
+    if (Date.now() - startedAt > timeBudgetMs) {
+      return { deferred: true };
+    }
+    const speed = await getSpeed(item.key, item.endpoint);
+    if (speed.error) return { deferred: true }; // 保持待测速，下轮再试
+    if (!withinLatencyRange(speed.latencyMs)) return { deleted: true };
+    return { line: `${item.line}|${speed.latencyMs}ms` };
+  });
+
+  for (let i = 0; i < targets.length; i++) {
+    const r = results[i];
+    if (r.deferred) {
+      stats.deferred++;
+    } else if (r.deleted) {
+      lines[targets[i].index] = null;
+      stats.deleted++;
+    } else {
+      lines[targets[i].index] = r.line;
+      stats.processed++;
+    }
+  }
+
+  return stats;
+}
+
+function withinLatencyRange(latencyMs) {
+  return latencyMs >= LATENCY_MIN_MS && latencyMs <= LATENCY_MAX_MS;
 }
 
 function sortLinesByLatency(lines) {
@@ -773,9 +818,13 @@ async function handleFetch(env, corsHeaders, ctx) {
 // ==================== IP 查询相关（保持原有逻辑） ====================
 
 const BATCH_MAX_IPS = 100;
-// 单轮处理的端点上限：4.5 分钟预算下最差情况可处理约 400 个，
-// 设 400 让单轮能覆盖常见规模；上限过高会让尾部节点在预算耗尽时被推迟。
-const MAX_PER_RUN = 400;
+// 两阶段处理的中间标记：归属已确定、等待延迟测试。
+const PENDING_SPEED_MARK = '#待测速';
+
+// 分阶段上限：归属阶段受批量接口约束（每批 100 个），测速阶段受并发与超时约束。
+// 单轮 4.5 分钟预算下最差可处理约 400 个，设 400 覆盖常见规模。
+const MAX_GEO_PER_RUN = 400;
+const MAX_SPEED_PER_RUN = 400;
 // 并发连接数：Workers 单次调用最多 6 个同时建连，用满 6 个。
 const SPEED_TEST_CONCURRENCY = 6;
 // 每个端点测速次数：跨境节点首次握手常失败，多次尝试可避免误删。
@@ -1111,16 +1160,18 @@ async function handleAdmin(env) {
     const allLines = cached.split('\n');
     let totalLines = 0;
     let unprocessed = 0;
+    let pendingSpeed = 0;
 
     for (const line of allLines) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
       totalLines++;
       if (trimmed.endsWith('#未处理')) unprocessed++;
+      else if (trimmed.endsWith(PENDING_SPEED_MARK)) pendingSpeed++;
     }
 
-    const processed = totalLines - unprocessed;
-    cacheInfo = `已缓存（约 ${totalLines} 条记录，已处理 ${processed}，未处理 ${unprocessed}）`;
+    const processed = totalLines - unprocessed - pendingSpeed;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已完成 ${processed}，待归属 ${unprocessed}，待测速 ${pendingSpeed}）`;
   }
   
   // API 成功率统计功能已移除
@@ -1298,13 +1349,13 @@ async function handleAdmin(env) {
         <li><strong>结果格式：</strong>每行原有 <code>#</code> 之后的文字会被丢弃，由程序重新追加结果标记</li>
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的建连时间，多次探测取最快值</li>
-        <li><strong>有效性验证：</strong>先用 <strong>TCP 快速筛选</strong>（不通立即跳过），再对可达节点做 <strong>TLS 握手验证</strong>，能剔除“TCP 通但 TLS 不通”的伪可用节点</li>
+        <li><strong>两阶段处理：</strong>先集中完成<strong>归属地解析</strong>，全部完成后才进入<strong>延迟测试</strong>。归属阶段产出 <code>#地区#待测速</code>，测速阶段再补上 <code>|Nms</code></li>
         <li><strong>稳定性门槛：</strong>共测 ${SPEED_TEST_ATTEMPTS} 次，需<strong>全部成功</strong>才算有效。只偶尔连通的节点在实际使用中会大量超时，因此不予保留</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
-        <li><strong>失败处理：</strong>归属地未确认或测速失败的节点会<strong>保留为 <code>#未处理</code></strong>，下一轮继续尝试，不会因单轮接口波动被批量清空；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
+        <li><strong>失败处理：</strong>归属地未确认的节点保留 <code>#未处理</code>；测速失败的保留 <code>#待测速</code>，均在后续轮次重试，不会因单轮接口波动被批量清空；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
         <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（内容未变时不重建）；「立即处理」推进当前待处理队列；「重新处理全部」清空已完成结果并重跑当前列表；「强制重建」忽略内容哈希，重新拉取上游并把全部节点重新入队（节点被大量删除后用它恢复）</li>
-        <li><strong>状态标记：</strong><code>#未处理</code> 排队中；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
+        <li><strong>状态标记：</strong><code>#未处理</code> 待归属；<code>#待测速</code> 待测延迟；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
       </ul>
     </div>
   </div>
