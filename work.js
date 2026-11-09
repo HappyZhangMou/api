@@ -392,9 +392,9 @@ async function runGeoPhase(env, lines, timeBudgetMs) {
       continue; // 保持 #未处理
     }
 
-    // 域名行：无需归属，直接进入测速队列
+    // 域名行：无需归属，也无需测速，直接标记为终态优选域名
     if (!item.ip) {
-      lines[item.index] = `${item.line}${PENDING_SPEED_MARK}`;
+      lines[item.index] = `${item.line}${DOMAIN_MARK}`;
       stats.processed++;
       stats.changed = true;
       continue;
@@ -820,6 +820,8 @@ async function handleFetch(env, corsHeaders, ctx) {
 const BATCH_MAX_IPS = 100;
 // 两阶段处理的中间标记：归属已确定、等待延迟测试。
 const PENDING_SPEED_MARK = '#待测速';
+// 优选域名的终态标记：域名只做归类，不参与测速。
+const DOMAIN_MARK = '#优选域名';
 
 // 分阶段上限：归属阶段受批量接口约束（每批 100 个），测速阶段受并发与超时约束。
 // 单轮 4.5 分钟预算下最差可处理约 400 个，设 400 覆盖常见规模。
@@ -1161,6 +1163,7 @@ async function handleAdmin(env) {
     let totalLines = 0;
     let unprocessed = 0;
     let pendingSpeed = 0;
+    let domainCount = 0;
 
     for (const line of allLines) {
       const trimmed = line.trim();
@@ -1168,10 +1171,11 @@ async function handleAdmin(env) {
       totalLines++;
       if (trimmed.endsWith('#未处理')) unprocessed++;
       else if (trimmed.endsWith(PENDING_SPEED_MARK)) pendingSpeed++;
+      else if (trimmed.endsWith(DOMAIN_MARK)) domainCount++;
     }
 
     const processed = totalLines - unprocessed - pendingSpeed;
-    cacheInfo = `已缓存（约 ${totalLines} 条记录，已完成 ${processed}，待归属 ${unprocessed}，待测速 ${pendingSpeed}）`;
+    cacheInfo = `已缓存（约 ${totalLines} 条记录，已完成 ${processed}，待归属 ${unprocessed}，待测速 ${pendingSpeed}，优选域名 ${domainCount}）`;
   }
   
   // API 成功率统计功能已移除
@@ -1352,7 +1356,7 @@ async function handleAdmin(env) {
         <li><strong>两阶段处理：</strong>先集中完成<strong>归属地解析</strong>，全部完成后才进入<strong>延迟测试</strong>。归属阶段产出 <code>#地区#待测速</code>，测速阶段再补上 <code>|Nms</code></li>
         <li><strong>稳定性门槛：</strong>共测 ${SPEED_TEST_ATTEMPTS} 次，需<strong>全部成功</strong>才算有效。只偶尔连通的节点在实际使用中会大量超时，因此不予保留</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
-        <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只测延迟、不查归属地（Anycast 域名的国家信息无参考价值），输出 <code>cf.example.com:443|38ms</code>，并与 IP 一起按延迟排序</li>
+        <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只做归类，<strong>不查归属地、也不测速</strong>（Anycast 域名的国家与延迟参考价值有限），直接输出 <code>cf.example.com:443#优选域名</code></li>
         <li><strong>失败处理：</strong>归属地未确认的节点保留 <code>#未处理</code>；测速失败的保留 <code>#待测速</code>，均在后续轮次重试，不会因单轮接口波动被批量清空；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
         <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（内容未变时不重建）；「立即处理」推进当前待处理队列；「重新处理全部」清空已完成结果并重跑当前列表；「强制重建」忽略内容哈希，重新拉取上游并把全部节点重新入队（节点被大量删除后用它恢复）</li>
         <li><strong>状态标记：</strong><code>#未处理</code> 待归属；<code>#待测速</code> 待测延迟；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
