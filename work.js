@@ -314,7 +314,9 @@ async function processIpQueue(env, timeBudgetMs = HTTP_RUN_BUDGET_MS) {
       const geoStillPending = lines.some(line => line && line.endsWith('#未处理'));
       if (geoStats.processed === 0 && !geoStillPending) {
         speedStats = await runSpeedPhase(lines, timeBudgetMs);
-        changed = changed || speedStats.processed > 0 || speedStats.deleted > 0;
+        // 处理成功、淘汰、以及失败重写（deferred）都算变更，需写回；
+        // 否则本轮无写入，节点会永远停留在同一状态。
+        changed = changed || speedStats.processed > 0 || speedStats.deleted > 0 || speedStats.deferred > 0;
       } else if (geoStillPending) {
         console.log('[Queue] Geo phase pending remains; speed phase waits for next round.');
       }
@@ -463,7 +465,7 @@ async function runSpeedPhase(lines, timeBudgetMs) {
       return { deferred: true };
     }
     const speed = await getSpeed(item.key, item.endpoint);
-    if (speed.error) return { deferred: true }; // 保持待测速，下轮再试
+    if (speed.error) return { failed: true };
     if (!withinLatencyRange(speed.latencyMs)) return { deleted: true };
     return { line: `${item.line}|${speed.latencyMs}ms` };
   });
@@ -472,6 +474,18 @@ async function runSpeedPhase(lines, timeBudgetMs) {
     const r = results[i];
     if (r.deferred) {
       stats.deferred++;
+    } else if (r.failed) {
+      // 测速失败：累计失败次数，达到阈值即淘汰。
+      // 之前无条件保留 #待测速 会让不通的节点永久滞留，
+      // 形成"每轮重测同一批、永远失败"的死循环。
+      const fails = bumpFailCount(targets[i].line);
+      if (fails >= MAX_SPEED_FAILS) {
+        lines[targets[i].index] = null;
+        stats.deleted++;
+      } else {
+        lines[targets[i].index] = `${targets[i].line}${PENDING_SPEED_MARK}`;
+        stats.deferred++;
+      }
     } else if (r.deleted) {
       lines[targets[i].index] = null;
       stats.deleted++;
@@ -482,6 +496,15 @@ async function runSpeedPhase(lines, timeBudgetMs) {
   }
 
   return stats;
+}
+
+// 测速失败计数：同一节点连续失败达到阈值即淘汰，避免永久滞留。
+const speedFailCounts = new Map();
+
+function bumpFailCount(key) {
+  const next = (speedFailCounts.get(key) || 0) + 1;
+  speedFailCounts.set(key, next);
+  return next;
 }
 
 function withinLatencyRange(latencyMs) {
@@ -827,13 +850,16 @@ const DOMAIN_MARK = '#优选域名';
 // 单轮 4.5 分钟预算下最差可处理约 400 个，设 400 覆盖常见规模。
 const MAX_GEO_PER_RUN = 400;
 const MAX_SPEED_PER_RUN = 400;
+// 测速连续失败达到该次数即淘汰，避免不通的节点永久停留在 #待测速。
+const MAX_SPEED_FAILS = 3;
 // 并发连接数：Workers 单次调用最多 6 个同时建连，用满 6 个。
 const SPEED_TEST_CONCURRENCY = 6;
 // 每个端点测速次数：跨境节点首次握手常失败，多次尝试可避免误删。
 const SPEED_TEST_ATTEMPTS = 3;
 // 稳定性门槛：要求至少这么多次成功才算可用。
-// 只成功 1 次的节点在实际使用中极易超时，必须剔除。
-const STABILITY_MIN_SUCCESS = 3;
+// 设为全部成功（3/3）在跨境链路上过于苛刻，绝大多数节点会被判失败并永久滞留，
+// 因此放宽为 2/3：兼顾"过滤抖动节点"和"能真正完成处理"。
+const STABILITY_MIN_SUCCESS = 2;
 // Free 计划每天仅 1000 次 KV 写入，而 cached_aggregate 每轮最少写 1 次。
 // 每分钟一轮 = 1440 次/天，必然超限并被平台拒绝写入（表现为处理停滞）。
 // 因此改为每 5 分钟一轮、单轮跑满 4.5 分钟：288 次/天，稳定在额度内。
@@ -1354,10 +1380,10 @@ async function handleAdmin(env) {
         <li><strong>IP 归属地（三源投票）：</strong><code>ip-api</code>、<code>countries.dev</code>、<code>GeoJS</code> 三个免费免 Key 的批量接口并行查询，国家代码至少两家一致才采纳</li>
         <li><strong>IP 输出：</strong><code>1.2.3.4:443#JP日本|92ms</code>。延迟是 Worker 到目标的建连时间，多次探测取最快值</li>
         <li><strong>两阶段处理：</strong>先集中完成<strong>归属地解析</strong>，全部完成后才进入<strong>延迟测试</strong>。归属阶段产出 <code>#地区#待测速</code>，测速阶段再补上 <code>|Nms</code></li>
-        <li><strong>稳定性门槛：</strong>共测 ${SPEED_TEST_ATTEMPTS} 次，需<strong>全部成功</strong>才算有效。只偶尔连通的节点在实际使用中会大量超时，因此不予保留</li>
+        <li><strong>稳定性门槛：</strong>共测 ${SPEED_TEST_ATTEMPTS} 次，需至少 ${STABILITY_MIN_SUCCESS} 次成功才算有效</li>
         <li><strong>延迟过滤：</strong>只保留 <code>${LATENCY_MIN_MS}ms ~ ${LATENCY_MAX_MS}ms</code> 的节点。低于 ${LATENCY_MIN_MS}ms（多为不可用的劫持/内网响应）或高于 ${LATENCY_MAX_MS}ms（过慢）的节点会被<strong>直接删除</strong></li>
         <li><strong>优选域名：</strong>形如 <code>cf.example.com:443</code> 的行只做归类，<strong>不查归属地、也不测速</strong>（Anycast 域名的国家与延迟参考价值有限），直接输出 <code>cf.example.com:443#优选域名</code></li>
-        <li><strong>失败处理：</strong>归属地未确认的节点保留 <code>#未处理</code>；测速失败的保留 <code>#待测速</code>，均在后续轮次重试，不会因单轮接口波动被批量清空；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
+        <li><strong>失败处理：</strong>归属地未确认的节点保留 <code>#未处理</code>；测速失败的保留 <code>#待测速</code> 并在后续轮次重试，连续 ${MAX_SPEED_FAILS} 次失败即淘汰；只有<strong>延迟超出区间</strong>和 <code>#CN中国</code> 节点会被直接删除</li>
         <li><strong>按钮说明：</strong>「保存链接」写入订阅并刷新；「立即拉取并刷新」重新拉取上游（内容未变时不重建）；「立即处理」推进当前待处理队列；「重新处理全部」清空已完成结果并重跑当前列表；「强制重建」忽略内容哈希，重新拉取上游并把全部节点重新入队（节点被大量删除后用它恢复）</li>
         <li><strong>状态标记：</strong><code>#未处理</code> 待归属；<code>#待测速</code> 待测延迟；<code>#Cloudflare</code> 为 Cloudflare 出站节点；<code>#CN中国</code> 节点会被自动移除</li>
       </ul>
